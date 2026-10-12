@@ -58,7 +58,9 @@ console.log('[dsh-android-seagull] persona loaded: full=' + personaText.length +
 
 // root/ADB 通道工具名单（非 danger 档位 deny 集）——全部经 gateFor 前置校验，
 // 非 danger-full-access 会话中调用必被拒，schema 属纯 token 开销：
-// - root-ops 10 个：root 通道（su/KernelSU），root 感知说明也仅 danger 注入；
+// - root-ops 13 个：root 通道（su/KernelSU），root 感知说明也仅 danger 注入
+//   （10 个文件/执行/UI 工具 + ubuntu_boot_fix + keepalive 三件套——保活巡检是
+//   root shell 循环 + Doze 白名单，非 danger 会话无 root 可用，schema 纯开销）；
 // - manage 8 个：androidPrivilege ADB 通道（screencap/uiautomator/dumpsys/input）；
 // - bridge 2 个 ADB 执行面（android_privilege_status 为只读状态查询，保留不裁）；
 // - ubuntu_toolchain_install：root chroot apt（坑 13/38 root 专属路径）；
@@ -66,6 +68,7 @@ console.log('[dsh-android-seagull] persona loaded: full=' + personaText.length +
 const DANGER_CHANNEL_TOOLS = [
   'root_exec', 'device_ui_control', 'root_status', 'root_ls', 'root_cat',
   'root_push', 'root_pull', 'root_fetch', 'root_deploy', 'ubuntu_boot_fix',
+  'keepalive_install', 'keepalive_status', 'keepalive_uninstall',
   'android_act_input', 'android_device_info', 'android_screenshot',
   'android_ui_click', 'android_ui_dump', 'android_ui_input',
   'android_ui_scroll', 'android_ui_tree',

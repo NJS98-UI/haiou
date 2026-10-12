@@ -34,6 +34,10 @@ jobs:
         run: |
           node scripts/check-boot-script.mjs
           node scripts/sim-boot-script.mjs
+      - name: 保活巡检脚本一致性（坑 48 同款纪律）
+        run: |
+          node scripts/check-keepalive-script.mjs
+          node scripts/sim-keepalive-script.mjs
       # 插件版本钉门禁（2026-10 第三轮复盘接线）：此前 check-contract.mjs 只存在于手动执行与
       # 文档记载——某插件私自升降 dsh-tools/cordis/schemastery 版本 → 装配期 ERESOLVE/类型崩
       # （坑 41/42 家族复发）且 CI 零拦截。注意其 inserted 仅覆盖 shell-termux/ui-responsive 两项，

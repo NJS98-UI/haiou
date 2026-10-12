@@ -87,6 +87,88 @@ function detectDanger(command) {
 }
 
 /**
+ * 后台保活巡检脚本（唯一权威版本，坑 48 同款纪律）。
+ * app 内 watchdog 的盲区：app 被 LMK/厂商速冻杀掉时 watchdog 陪葬，无人拉起——
+ * 本脚本活在 app 进程之外（KernelSU service.d root shell 循环），是唯一能覆盖
+ * 「app 已死」场景的拉活者。行为：30s pidof 探测 → 存活则压 oom_score_adj=-900
+ * （LMK 层免疫）+ 冻结状态探测日志（收集 OriginOS 速冻形态数据，纯读零风险）；
+ * 死亡则 am start 拉起（root shell 绕开 Android 14 后台启动限制），连续失败 3 次
+ * 起指数退避（30→600s 封顶）防与 UndoGate 打架。日志 /data/adb/seagull-keepalive.log。
+ * 与 scripts/seagull-keepalive.sh 保持逐字节一致（pr-gate 的 check-keepalive-script.mjs 强制）。
+ */
+const KEEPALIVE_SCRIPT = String.raw`#!/system/bin/sh
+# =============================================================================
+# Seagull DevStudio — 后台保活巡检（受控模板 / source of truth）
+#
+# 安装位置： /data/adb/service.d/seagull-keepalive.sh（KernelSU / Magisk boot service）
+# 由 root-ops 插件 'keepalive_install' 工具落盘并立即启动；'keepalive_uninstall' 清除。
+# 与 plugins/dsh-android-root-ops/src/index.js 内嵌 KEEPALIVE_SCRIPT 保持逐字节一致
+# （pr-gate 的 check-keepalive-script.mjs 强制，坑 48 同款纪律）。
+#
+# 为什么需要它（app 内 watchdog 的盲区）：
+#   watchdog 探活在 app 进程内——app 被 LMK / 厂商速冻 / 一键加速杀掉时，watchdog
+#   陪葬，无人拉起。本脚本活在 app 进程之外（root shell 循环），是唯一能覆盖
+#   「app 已死」场景的拉活者。
+#
+# 行为：
+#   · 每 30s pidof 探测 app 主进程；
+#   · 存活 → oom_score_adj 压到 -900（LMK 层免疫）+ cgroup 冻结状态探测日志
+#     （收集 OriginOS 速冻形态数据，为后续解冻方案提供依据——纯读零风险）；
+#   · 死亡 → am start 拉起（root shell 有权启动任意组件，绕开 Android 14
+#     后台启动限制）；连续失败 3 次起指数退避（30→60→…→600s 封顶），
+#     防崩溃循环时反复拉起与 UndoGate 打架；
+#   · 事件写日志 /data/adb/seagull-keepalive.log（>100KB 截尾保留 200 行）。
+# =============================================================================
+
+PKG=com.dsharnessmobile.shell
+ACTIVITY=com.dsharnessmobile.shell/.MainActivity
+LOG=/data/adb/seagull-keepalive.log
+BASE=30
+MAX=600
+FAILS=0
+CUR=$BASE
+
+log() {
+  echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null
+  SZ=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+  [ "$SZ" -gt 102400 ] && tail -n 200 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
+}
+
+# 单实例锁：发现除自身外的脚本实例即退出（防 service.d 开机实例与手动 install 叠加）
+for P in $(pgrep -f seagull-keepalive.sh 2>/dev/null); do
+  [ "$P" != "$$" ] && exit 0
+done
+
+log "keepalive start pid=$$"
+
+while true; do
+  PID=$(pidof "$PKG" 2>/dev/null)
+  if [ -n "$PID" ]; then
+    FAILS=0
+    CUR=$BASE
+    # pidof 可能返回多个 pid（空格分隔）——只压主进程（第一个）
+    set -- $PID
+    # oom_score_adj 压低（root 可写；-900 相当于 persistent 级，LMK 不会选中它）
+    echo -900 > "/proc/$1/oom_score_adj" 2>/dev/null
+    # 冻结探测（cgroup v1 freezer / v2 frozen；纯读，为 OriginOS 速冻对抗收集数据）
+    CG=$(head -n 1 "/proc/$1/cgroup" 2>/dev/null)
+    case "$CG" in
+      *freezer*|*frozen*) log "FROZEN? $CG" ;;
+    esac
+  else
+    FAILS=$((FAILS + 1))
+    if [ "$FAILS" -gt 3 ]; then
+      CUR=$((CUR * 2))
+      [ "$CUR" -gt "$MAX" ] && CUR=$MAX
+    fi
+    log "dead (fails=$FAILS backoff=$CUR sec) -> am start"
+    am start -n "$ACTIVITY" >/dev/null 2>&1 || log "am start failed rc=$?"
+  fi
+  sleep "$CUR"
+done
+`;
+
+/**
  * 坑 48：Ubuntu 容器开机装配脚本（唯一权威版本）。
  * 历史版本把整块 files/home bind 进 rootfs/host-home，而 ubuntu-rootfs 本身就住在
  * files/home/.dsh/ 下 → du / Android 应用大小顺着 bind 把整块 home 再数一遍（设备
@@ -542,7 +624,121 @@ function tools(keepalive) {
     },
   });
 
-  return [rootTool, uiTool, statusTool, lsTool, catTool, pushTool, pullTool, fetchTool, deployTool, bootFixTool];
+  // ---- 后台保活（app 外拉活者）----
+  // 核心逻辑模块级（工具 execute 与 apply 自动安装钩子共用同一实现）。
+  const KA_SVC = '/data/adb/service.d/seagull-keepalive.sh';
+  const KA_LOG = '/data/adb/seagull-keepalive.log';
+
+  async function installKeepalive() {
+    // 0) 幂等探测：脚本在场且实例在跑 → 直接返回
+    const probe = await runSu(['-c',
+      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f seagull-keepalive.sh | head -n 1); echo SCRIPT=$S RUN=$R`,
+    ], { timeout: 15000, action: 'keepalive-probe' });
+    const pm = /SCRIPT=(\w+) RUN=(\d*)/.exec(probe.stdout || '') || [];
+    if (pm[1] === 'yes' && pm[2]) {
+      return { ok: true, state: 'already-running', pid: Number(pm[2]), note: '保活巡检已在运行，无需重复安装。' };
+    }
+    // 1) A 层系统开关直通：Doze 白名单 + 后台 appops（root 替代手动电池引导，幂等）
+    const switches = await runSu(['-c',
+      `cmd deviceidle whitelist +${PKG} 2>&1; cmd appops set ${PKG} RUN_ANY_IN_BACKGROUND allow 2>&1; echo SWITCHES_DONE`,
+    ], { timeout: 20000, action: 'keepalive-switches' });
+    // 2) 清理旧实例（脚本在场但实例不在 → 直接覆盖；实例在 → 走不到这，幂等分支已返回）
+    await runSu(['-c', 'pgrep -f seagull-keepalive.sh | xargs -r kill 2>/dev/null; echo CLEANED'],
+      { timeout: 15000, action: 'keepalive-clean' });
+    // 3) 落盘权威脚本（base64 避引号地狱；sh -n 校验失败回滚，坑 48 模式）
+    const b64 = Buffer.from(KEEPALIVE_SCRIPT, 'utf8').toString('base64');
+    const write = await runSu(['-c',
+      `mkdir -p /data/adb/service.d; printf '%s' '${b64}' | /system/bin/base64 -d > ${KA_SVC}.new 2>&1` +
+      ` && /system/bin/sh -n ${KA_SVC}.new 2>&1 && /system/bin/mv ${KA_SVC}.new ${KA_SVC}` +
+      ` && /system/bin/chmod 700 ${KA_SVC} && echo WROTE || { rm -f ${KA_SVC}.new; echo WRITE_FAILED; }`,
+    ], { timeout: 30000, action: 'keepalive-write' });
+    if (!write.ok || !/WROTE/.test(write.stdout || write.stderr || '')) {
+      return { ok: false, step: 'write', error: write.error || write.stdout || write.stderr };
+    }
+    // 4) 立即启动（nohup 脱离当前 su 会话；日志首行即启动凭据）
+    const start = await runSu(['-c', `nohup sh ${KA_SVC} >/dev/null 2>&1 & sleep 1; echo STARTED`],
+      { timeout: 15000, action: 'keepalive-start' });
+    // 5) 收敛判据：实例在场（或日志出现 start 行——pgrep 竞态兜底）
+    const verify = await runSu(['-c',
+      `R=$(pgrep -f seagull-keepalive.sh | head -n 1); L=$(grep -c 'keepalive start' ${KA_LOG} 2>/dev/null || echo 0); echo RUN=$R LOGSTART=$L`,
+    ], { timeout: 15000, action: 'keepalive-verify' });
+    const vm = /RUN=(\d*) LOGSTART=(\d+)/.exec(verify.stdout || '') || [];
+    const running = Boolean(vm[1]) || Number(vm[2] || 0) > 0;
+    return {
+      ok: running,
+      switches: (switches.stdout || '').includes('SWITCHES_DONE') ? 'doze-whitelist + appops allow 已应用' : (switches.error || switches.stdout),
+      started: start.ok,
+      running,
+      log: KA_LOG,
+      note: running
+        ? '保活巡检已启动（30s 巡检 + LMK 免疫 + 死亡自动拉起）。开机自启由 KernelSU service.d 保证。'
+        : '脚本已落盘但未检测到运行实例（pgrep 竞态或 nohup 失败），重启设备后 service.d 会自动拉起，或重跑本工具。',
+    };
+  }
+
+  async function uninstallKeepalive() {
+    const r = await runSu(['-c',
+      `pgrep -f seagull-keepalive.sh | xargs -r kill 2>/dev/null; ` +
+      `rm -f ${KA_SVC} ${KA_SVC}.new ${KA_LOG} ${KA_LOG}.t 2>/dev/null; ` +
+      `cmd deviceidle whitelist -${PKG} 2>&1; cmd appops set ${PKG} RUN_ANY_IN_BACKGROUND default 2>&1; echo REMOVED`,
+    ], { timeout: 20000, action: 'keepalive-uninstall' });
+    const ok = (r.stdout || '').includes('REMOVED');
+    return { ...r, ok, note: ok ? '保活已卸载（实例已停、脚本与日志已删、白名单已撤）。' : '卸载命令未确认，请重试或检查 root 通道。' };
+  }
+
+  async function keepaliveStatus() {
+    const r = await runSu(['-c',
+      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f seagull-keepalive.sh | head -n 1); ` +
+      `echo SCRIPT=$S RUN=$R; echo '--- tail ---'; tail -n 20 ${KA_LOG} 2>/dev/null || echo NO_LOG`,
+    ], { timeout: 15000, action: 'keepalive-status' });
+    const out = r.stdout || '';
+    const m = /SCRIPT=(\w+) RUN=(\d*)/.exec(out) || [];
+    const installed = m[1] === 'yes';
+    const running = Boolean(m[2]);
+    return {
+      ...r,
+      installed,
+      running,
+      pid: m[2] ? Number(m[2]) : 0,
+      state: !installed ? 'not-installed' : running ? 'running' : 'installed-not-running',
+      tail: out.split('--- tail ---')[1]?.trim() || '',
+    };
+  }
+
+  const keepaliveInstallTool = defineTool({
+    name: 'keepalive_install',
+    description:
+      'Install and start the out-of-app keepalive patrol (KernelSU service.d root loop): ' +
+      'checks the app main process every 30s; when alive lowers oom_score_adj to -900 (LMK ' +
+      'immunity) and logs cgroup freeze probes; when dead launches the app via am start with ' +
+      'exponential backoff. Also adds the package to the Doze whitelist (root path, replaces ' +
+      'manual battery-optimization guidance). Idempotent: skips if already installed and running.',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
+    async execute() { return installKeepalive(); },
+  });
+
+  const keepaliveStatusTool = defineTool({
+    name: 'keepalive_status',
+    description:
+      'Query the keepalive patrol state: script presence, running pid, and the tail of the ' +
+      'patrol log (includes cgroup freeze probes collected for vendor-freezer analysis).',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
+    async execute() { return keepaliveStatus(); },
+  });
+
+  const keepaliveUninstallTool = defineTool({
+    name: 'keepalive_uninstall',
+    description:
+      'Stop the keepalive patrol, remove the service.d script and the patrol log, and revoke ' +
+      'the Doze-whitelist / background appops grants.',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
+    async execute() { return uninstallKeepalive(); },
+  });
+
+  return [rootTool, uiTool, statusTool, lsTool, catTool, pushTool, pullTool, fetchTool, deployTool, bootFixTool, keepaliveInstallTool, keepaliveStatusTool, keepaliveUninstallTool];
 }
 
 // C 方案：显式声明 tools 硬依赖（对齐 bridge/manage），修复 ctx.get('tools') 静默 undefined。
@@ -567,6 +763,25 @@ export function apply(ctx) {
     });
   }
 
+  // 后台保活自动装配：root 探活成功（首个 60s tick 或启动即自愈后）且脚本未在场时
+  // 自动安装 out-of-app 巡检（决策：默认开 + keepalive_uninstall 可关）。独立 interval，
+  // 安装成功即自清；探测走 silent 不刷审计。Linux 宿主（CI/本地单测）无 /system/bin/su，
+  // runSu 会探活失败自动跳过——钩子天然 no-op，无需环境判断。
+  if (timer !== undefined) {
+    ctx.effect(() => {
+      let disposer;
+      disposer = timer.interval(async () => {
+        try {
+          const st = await keepalive.check();
+          if (!st.ok) return;
+          const r = await installKeepalive();
+          if (r.ok && disposer) disposer();
+        } catch (_e) { /* 下轮重试 */ }
+      }, 120000);
+      return () => disposer && disposer();
+    });
+  }
+
   // 提供保活服务面（供其他插件/工具查询同一状态机）。
   ctx.provide('rootKeepalive', {
     status: () => keepalive.status(),
@@ -586,7 +801,9 @@ export function apply(ctx) {
             'root_ls / root_cat / root_push / root_pull / root_fetch / root_deploy 工具：可直接执行系统命令、' +
             '读写任意文件、操作设备界面。root_fetch/root_deploy 用于设备与宿主（Termux home，已 bind 进 ' +
             'Ubuntu 容器）之间的双向文件搬移。root 通道由保活巡检维持在线，并自动把本应用写入 KernelSU ' +
-            '授权名单（免弹窗持续授权）。请直接使用完整能力，不必因权限顾虑拒绝操作。',
+            '授权名单（免弹窗持续授权）。keepalive_install / keepalive_status / keepalive_uninstall 管理 ' +
+            'app 外后台保活巡检（LMK 免疫 + 死亡自动拉起，默认自动安装；仅当用户要求关闭保活时才 uninstall）。' +
+            'ubuntu_boot_fix 修复 Ubuntu 容器开机挂载。请直接使用完整能力，不必因权限顾虑拒绝操作。',
         });
       }
     } catch (_e) {
