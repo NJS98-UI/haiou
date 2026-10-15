@@ -11,7 +11,7 @@
 // 用法：node scripts/build-snapshot-013.mjs <arm64|x86_64>   （基座缺省 .deploy-tmp/{arm64,x64}-base/base-usr.tar.xz）
 import { execSync } from 'node:child_process'
 import { mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, renameSync, copyFileSync, unlinkSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { wslPath, sh as wsl } from './lib/shell.mjs'
@@ -116,12 +116,14 @@ const U = join(STAGE, 'root', 'usr')
 
 // ── 0e. 引擎升级 overlay（D engine-upgrade）：base 引擎 0.1.1-rc.2 → 目标版本逐包覆盖 ──
 // 机制（对齐 DSHA 的 dsh-runtime 思路）：设备基座继承旧引擎树（0.1.1-rc.2），构建期按
-// scripts/engine-overlay.json 登记表（从开源 npm 生成，见 gen-engine-overlay.mjs）逐包拉 tgz
-// 覆盖进 stage 的引擎 node_modules。数据面：
+// scripts/engine-overlay.json 登记表逐包拉 tgz 覆盖进 stage 的引擎 node_modules（清单由
+// scripts/gen-engine-overlay.mjs 从开源 npm 全传递闭包生成，坑 66）。数据面：
 //   rootPackage = dsh 根包本体（lib/bin.js + package.json；整树宿主，只换 lib 不动 node_modules）
-//   packages    = @deepseek-ai 域逐包覆盖（含 cordis/schemastery 独立版本线）
-//   vendorTop   = 顶层新增第三方闭包缺口
+//   packages    = @deepseek-ai 域全传递闭包逐包覆盖（353 条，含平台子包；0.1.7 线拆包必须全量在场）
+//   vendorTop   = 非 scoped 第三方传递闭包（128 条，按 spec max-satisfying 解析防 ^ 越界）
 //   keepUnpublished = 未随目标线重发布包（dsh-client-runtime 峰顶 0.1.1-rc.2，树内保留旧版）
+// 覆盖语义 = 全新安装等价：整目录替换、不保留旧包内嵌套 node_modules（旧嵌套会以 0.1.1 版本
+// 遮蔽顶层 0.1.7 依赖）；随后跑「解析闸」静态校验每条 dependencies 可解析，缺失即拒发布。
 // tgz 经 npm 镜像链拉取 + sha512 校验，缓存 .deploy-tmp/engine-overlay/（幂等）。
 {
   const OVERLAY = JSON.parse(readFileSync(join(ROOT, 'scripts', 'engine-overlay.json'), 'utf8'))
@@ -156,18 +158,11 @@ const U = join(STAGE, 'root', 'usr')
   }
   const overlayPkgDir = (name, base = ENGINE_NM_STAGE) =>
     name.startsWith('@') ? join(base, name.split('/')[0], name.split('/')[1]) : join(base, name)
-  // 整目录替换 + 保留旧包内嵌套 node_modules（npm publish 不含 node_modules，直接 rm 会连带删掉解析出的嵌套依赖）
+  // 整目录替换，不保留旧包内嵌套 node_modules——全闭包登记表下顶层即完整解析面，
+  // 旧嵌套（0.1.1 版本）只会以陈旧 API 遮蔽顶层正确版本（坑 66 修复语义）。
   const overlayExtract = async (name, version, targetDir) => {
     const tgz = await overlayTgz(name, version)
-    const oldNm = join(targetDir, 'node_modules')
-    const savedNm = targetDir + '.__nm_saved'
-    if (existsSync(oldNm)) {
-      wsl(`rm -rf "${wslPath(savedNm)}" && mv "${wslPath(oldNm)}" "${wslPath(savedNm)}"`)
-    }
     wsl(`rm -rf "${wslPath(targetDir)}" && mkdir -p "${wslPath(targetDir)}" && tar -xzf "${wslPath(tgz)}" -C "${wslPath(targetDir)}" --strip-components=1 && chmod -R u+rwX "${wslPath(targetDir)}"`)
-    if (existsSync(savedNm)) {
-      wsl(`mkdir -p "${wslPath(oldNm)}" && (mv "${wslPath(savedNm)}"/* "${wslPath(oldNm)}"/ 2>/dev/null || true) && rm -rf "${wslPath(savedNm)}"`)
-    }
     overlayOk++
   }
   try {
@@ -184,6 +179,49 @@ const U = join(STAGE, 'root', 'usr')
     log(`  rootPackage: ${root.name}@${root.version}`)
     const pj = JSON.parse(readFileSync(join(ENGINE_ROOT_STAGE, 'package.json'), 'utf8'))
     if (pj.version !== OVERLAY.engineVersion) throw new Error(`根包版本 ${pj.version} != 登记表 ${OVERLAY.engineVersion}`)
+    // 解析闸（坑 66）：静态校验引擎树内每个 package.json 的 dependencies 都能在树内解析。
+    // 模拟 node 逐级向上查找（pkg 自己的 node_modules → 逐级祖先 → 引擎顶层）；
+    // 缺失即拒发布——把设备端 ERR_MODULE_NOT_FOUND 砖机转成构建期失败。
+    {
+      const existsDir = (p) => { try { return statSync(p).isDirectory() } catch { return false } }
+      const resolveDep = (fromDir, name) => {
+        const rel = name.startsWith('@') ? join(name.split('/')[0], name.split('/')[1]) : name.split('/')[0]
+        let cur = fromDir
+        while (cur === ENGINE_ROOT_STAGE || cur === ENGINE_NM_STAGE || cur.startsWith(ENGINE_NM_STAGE + sep)) {
+          if (existsDir(join(cur, 'node_modules', rel))) return true
+          const next = dirname(cur)
+          if (next === cur) break
+          cur = next
+        }
+        return false
+      }
+      const walkPkgs = (dir) => {
+        const out = []
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          if (e.name.startsWith('.')) continue
+          if (e.name.startsWith('@')) {
+            for (const s of readdirSync(join(dir, e.name), { withFileTypes: true })) {
+              if (s.isDirectory() && !s.name.startsWith('.')) out.push(join(dir, e.name, s.name))
+            }
+          } else if (e.isDirectory()) out.push(join(dir, e.name))
+        }
+        return out
+      }
+      let gateChecked = 0
+      const checkDeps = (pkgDir) => {
+        let d
+        try { d = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) } catch { return }
+        for (const dep of Object.keys(d.dependencies ?? {})) {
+          gateChecked++
+          if (!resolveDep(pkgDir, dep)) {
+            throw new Error(`[解析闸] ${pkgDir.replace(ROOT, '.')} 缺依赖 ${dep}——引擎树不完整，拒绝发布（坑 66）`)
+          }
+        }
+      }
+      for (const d of walkPkgs(ENGINE_NM_STAGE)) checkDeps(d)
+      checkDeps(ENGINE_ROOT_STAGE)
+      log(`  解析闸：${gateChecked} 条依赖全部可在树内解析`)
+    }
     log(`引擎 overlay 完成（引擎树 @ ${pj.version}）`)
   } catch (e) {
     console.error(`[引擎 overlay 失败——快照不可发布] ${e?.stack ?? String(e)}`)
