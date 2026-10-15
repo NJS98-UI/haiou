@@ -576,15 +576,10 @@ class MainActivity : ComponentActivity() {
       FileIncoming.recordOpening(this, target.absolutePath)
       LogCollector.log("dsh-file-open", "incoming processed: " + target.absolutePath)
       // 引擎侧插件端点：路径交给 dsh-android-file-open 强制新会话（引擎未起时端点由启动流承托）。
+      // 0.13.5（坑 69）：走 EngineProbe.post 统一鉴权通道（0.1.7 起 /api/* 全部要会话 cookie）。
       try {
-        val conn = java.net.URL(EngineProbe.ENGINE_URL + "/api/android/file-incoming").openConnection() as java.net.HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 3000
         val body = org.json.JSONObject().put("path", target.absolutePath).toString()
-        conn.outputStream.use { it.write(body.toByteArray()) }
-        conn.responseCode
-        conn.disconnect()
+        EngineProbe.post("/api/android/file-incoming", body, readTimeoutMs = 3000)
       } catch (_: Exception) {
       }
       } catch (e: Exception) {
@@ -880,7 +875,8 @@ class MainActivity : ComponentActivity() {
         onRestartEngine = { restartEngine() },
         onShutdownToGuide = { shutdownToGuide() },
         onReloadWebUI = {
-          webView.reload()
+          // 0.13.5（坑 69）：同样重带 launch token 导航（纯 reload 在引擎重启后会 401）。
+          webView.loadUrl(EngineProbe.authenticatedUrl())
           showTestNotification("界面已刷新", "Web UI 已重新加载")
         },
         onOpenConsole = { startActivity(Intent(this, ConsoleActivity::class.java)) },
@@ -922,7 +918,9 @@ class MainActivity : ComponentActivity() {
       ),
       "androidBridge",
     )
-    webView.loadUrl(EngineProbe.ENGINE_URL)
+    // 0.13.5（坑 69）：0.1.7 引擎全路由鉴权——WebView 必须带 launch token 载入，
+    // 303 交换后 WebView 自己的 cookie jar 承接会话。
+    webView.loadUrl(EngineProbe.authenticatedUrl())
   }
 
   /**
@@ -1011,11 +1009,23 @@ class MainActivity : ComponentActivity() {
     Thread {
       var conn: HttpURLConnection? = null
       try {
-        val c = URL(url).openConnection() as HttpURLConnection
+        var c = URL(url).openConnection() as HttpURLConnection
         conn = c
         c.connectTimeout = 15_000
         c.readTimeout = 60_000
         c.requestMethod = "GET"
+        // 0.13.5（坑 69）：0.1.7 起 /api/* 全路由鉴权——app 内下载补会话 cookie，
+        // 401 时换票重试一次（引擎重启会让旧票失效）。
+        EngineProbe.sessionCookie()?.let { c.setRequestProperty("Cookie", it) }
+        if (c.responseCode == 401) {
+          conn.disconnect()
+          c = URL(url).openConnection() as HttpURLConnection
+          conn = c
+          c.connectTimeout = 15_000
+          c.readTimeout = 60_000
+          c.requestMethod = "GET"
+          EngineProbe.sessionCookie(force = true)?.let { c.setRequestProperty("Cookie", it) }
+        }
         if (c.responseCode != HttpURLConnection.HTTP_OK) {
           throw java.io.IOException("HTTP " + c.responseCode)
         }
@@ -1855,7 +1865,8 @@ class MainActivity : ComponentActivity() {
     if (::consoleFab.isInitialized) consoleFab.visibility = View.VISIBLE
     // The WebView may have rendered an error page before the engine was
     // ready (engine boot takes seconds); reload now that it answers.
-    webView.reload()
+    // 0.13.5（坑 69）：reload 会重放旧 URL——引擎重启后 token 已换代，必须重新带票导航。
+    webView.loadUrl(EngineProbe.authenticatedUrl())
   }
 
   /** 进入测试界面（引擎失败/未就绪回退）：状态 + 崩溃横幅 + engine.log 摘要。 */

@@ -5,9 +5,13 @@
 //   packages  = @deepseek-ai 域全部可达包（0.1.7 线把 0.1.1 单体拆成数百细粒度包，必须全量在场）
 //   vendorTop = 非 scoped 第三方传递闭包，按 spec 并集 max-satisfying 解析（dist-tags.latest 会越 caret 上界，
 //               如 js-yaml ^4.2.0 的 latest 是 5.x）；旧清单已有钉版若仍满足全部 spec 则保留（对齐已知可用组合）。
-// 可选依赖（平台二进制 @img/*、sherpa-onnx-* 等）与 peerDependencies 不入清单：
-//   前者需真机验证（Android bionic 无 android triple 的包本就装不上），后者由 build-snapshot-013.mjs 的
-//   「解析闸」在构建期兜底——缺什么闸会报什么，再手工补录即可。
+// 可选依赖（平台二进制 @img/*、sherpa-onnx-* 等）不入清单：
+//   前者需真机验证（Android bionic 无 android triple 的包本就装不上）。
+//   peerDependencies 则**必须**入闭包（坑 69）：0.1.7 线把包间装配依赖全部声明为
+//   peer（dependencies 只剩 cosmokit/zod 类基础设施），cordis 运行期从引擎树解析
+//   peer——只走 dependencies 面会系统性漏包（dsh-session-persistence 等），
+//   真机表现为 35 插件 failed to import 的 ESM 导出面漂移崩溃。
+//   peerDependenciesMeta.optional=true 的 peer 除外（宿主可缺省）。
 // 运行期未发布包（keepUnpublished，如 dsh-client-runtime 峰顶 0.1.1-rc.2）无 registry 元数据，保留原样。
 
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -106,7 +110,15 @@ async function walk(name, version) {
   if (!j) return
   const v = j.versions[version]
   if (!v) { failed.push(`${key} (version absent)`); return }
-  for (const [dep, spec] of Object.entries(v.dependencies ?? {})) {
+  // dependencies + peerDependencies 双面并集（坑 69：0.1.7 线包间依赖全走 peer）；
+  // peerDependenciesMeta 标记 optional 的 peer 不入闭包。
+  const reqDeps = { ...(v.dependencies ?? {}) }
+  const optPeers = new Set(Object.entries(v.peerDependenciesMeta ?? {}).filter(([, m]) => m?.optional).map(([k]) => k))
+  for (const [dep, spec] of Object.entries(v.peerDependencies ?? {})) {
+    if (!optPeers.has(dep)) reqDeps[dep] = spec
+  }
+  for (const [dep, spec] of Object.entries(reqDeps)) {
+    if (dep === name) continue // self-peer（同名自身）跳过，防自引用噪声
     if (!specWanted.has(dep)) specWanted.set(dep, new Set())
     specWanted.get(dep).add(spec)
     const dj = await packument(dep)

@@ -21,6 +21,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
   val usrDir = File(context.filesDir, "usr")
   val homeDir = File(context.filesDir, "home")
 
+  init {
+    // 0.13.5（坑 69）：探活/POST 鉴权要从 engine.log banner 解析 launch token，
+    // EngineManager 一经构造就绑定日志句柄（覆盖 app 重启、引擎孤儿保活场景）。
+    if (EngineProbe.logFile == null) {
+      EngineProbe.logFile = File(context.filesDir, "engine.log")
+    }
+  }
+
   /** 自包含 proot 落地目录（Operit app 域定制 proot/loader，替换 Termux proot 依赖，坑 38）。 */
   val operitNativeDir = File(usrDir, "share/operit-native")
 
@@ -970,6 +978,11 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
 
   /** Start the dsh web engine from the embedded snapshot. */
   fun startEngine(port: Int = EngineProbe.ENGINE_PORT): Boolean {
+    // 0.13.5（坑 69）：探活需要从 engine.log banner 解析 launch token；app 进程重启后
+    // （引擎孤儿保活场景）本方法可能先于 startWithArgs 被调用，这里就绑定日志句柄。
+    if (EngineProbe.logFile == null) {
+      EngineProbe.logFile = File(context.filesDir, "engine.log")
+    }
     // LD_PRELOAD depends on the snapshot's termux-exec lib: when missing, every child exec fails,
     // and combined with the cooldown window that means a silent 90s engine outage — assert explicitly
     // before starting and fail loudly if absent.
@@ -1056,6 +1069,10 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
    */
   private fun startWithArgs(args: Array<String>, env: Map<String, String>): Process {
     val log = File(context.filesDir, "engine.log")
+    // 0.13.5（坑 69）：引擎换代即换票——上代进程的 launch token 已失效，探活/WebView
+    // 必须重新从新 engine.log banner 解析 token 并重建 cookie 会话。
+    EngineProbe.invalidateSession()
+    EngineProbe.logFile = log
     rotateEngineLog(log)
     fun build(argv: List<String>): ProcessBuilder =
       ProcessBuilder(argv).also { b ->
@@ -1231,6 +1248,8 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       }
     }
     EngineManager.engineProcess = null
+    // 0.13.5（坑 69）：引擎停止即废票，清掉缓存的 token/cookie 会话。
+    EngineProbe.invalidateSession()
     // 进程句柄之外的孤儿（watchdog fork 的）也要收，与 killExistingEngine 兜底同口径。
     killOrphanEngineProcesses()
     LogCollector.log(TAG, "engine stopped (manual)")

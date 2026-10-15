@@ -24,8 +24,6 @@ import android.widget.TextView
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
  * 悬浮球实时面板（W7，PRD-0.13.2 §4）。
@@ -495,18 +493,10 @@ class OverlayService : Service() {
           .put("rpcId", "overlay-" + System.currentTimeMillis())
           .put("method", "session.cancel")
           .put("payload", JSONObject().put("sessionId", activeSessionId))
-        val conn = URL(EngineProbe.ENGINE_URL + "/api/session.cancel").openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 3000
-        conn.readTimeout = 5000
-        conn.setRequestProperty("content-type", "application/json")
-        conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-        val code = conn.responseCode
-        val body = conn.inputStream.bufferedReader().use { it.readText() }.take(200)
-        conn.disconnect()
+        // 0.13.5（坑 69）：0.1.7 起 /api/* 全路由鉴权，改走 EngineProbe.post（自动带 cookie，401 透明重鉴）。
+        val (code, body) = EngineProbe.post("/api/session.cancel", payload.toString())
         ok = code == 200
-        msg = if (ok) "已发送停止指令（" + body.take(60) + "）" else "停止失败（HTTP " + code + "）"
+        msg = if (ok) "已发送停止指令（" + body.take(60) + "）" else if (code == -1) "取消失败：引擎离线或网络异常" else "停止失败（HTTP " + code + "）"
       } catch (e: Exception) {
         msg = "取消失败：引擎离线或网络异常"
       }

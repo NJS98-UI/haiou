@@ -119,7 +119,8 @@ const U = join(STAGE, 'root', 'usr')
 // scripts/engine-overlay.json 登记表逐包拉 tgz 覆盖进 stage 的引擎 node_modules（清单由
 // scripts/gen-engine-overlay.mjs 从开源 npm 全传递闭包生成，坑 66）。数据面：
 //   rootPackage = dsh 根包本体（lib/bin.js + package.json；整树宿主，只换 lib 不动 node_modules）
-//   packages    = @deepseek-ai 域全传递闭包逐包覆盖（353 条，含平台子包；0.1.7 线拆包必须全量在场）
+//   packages    = @deepseek-ai 域全传递闭包逐包覆盖（377 条，含平台子包；0.1.7 线拆包必须全量在场；
+//                 闭包口径 = dependencies ∪ 非 optional peerDependencies，坑 69）
 //   vendorTop   = 非 scoped 第三方传递闭包（128 条，按 spec max-satisfying 解析防 ^ 越界）
 //   keepUnpublished = 未随目标线重发布包（dsh-client-runtime 峰顶 0.1.1-rc.2，树内保留旧版）
 // 覆盖语义 = 全新安装等价：整目录替换、不保留旧包内嵌套 node_modules（旧嵌套会以 0.1.1 版本
@@ -172,6 +173,16 @@ const U = join(STAGE, 'root', 'usr')
       await overlayExtract(name, version, overlayPkgDir(name))
     }
     log(`  engine node_modules 覆盖: ${overlayOk}`)
+    // 坑 69（2026-10-15 真机实锤）：npm 从不发布 node-addon-require-builtin 的
+    // android-arm64 预编译包，引擎树内 native binding 解析全线失败 → 每次启动
+    // ERR_MODULE_NOT_FOUND。注入仓内 JS shim（scripts/vendor-shims/），壳侧启动
+    // 引擎恒带 --expose-internals，shim 走 internal/modules 白名单等价供能。
+    {
+      const SHIM_SRC = join(ROOT, 'scripts', 'vendor-shims', 'node-addon-require-builtin-android-arm64')
+      const SHIM_DEST = join(ENGINE_NM_STAGE, 'node-addon-require-builtin-android-arm64')
+      wsl(`rm -rf "${wslPath(SHIM_DEST)}" && mkdir -p "${wslPath(SHIM_DEST)}" && cp "${wslPath(join(SHIM_SRC, 'package.json'))}" "${wslPath(join(SHIM_SRC, 'index.js'))}" "${wslPath(SHIM_DEST)}/"`)
+      log('  vendor shim: node-addon-require-builtin-android-arm64（JS shim，坑 69）')
+    }
     // 根包本体：只换 lib/ 与 package.json（node_modules 子树 = 全引擎依赖，绝不可动）
     const root = OVERLAY.rootPackage
     const tgz = await overlayTgz(root.name, root.version)
@@ -179,7 +190,9 @@ const U = join(STAGE, 'root', 'usr')
     log(`  rootPackage: ${root.name}@${root.version}`)
     const pj = JSON.parse(readFileSync(join(ENGINE_ROOT_STAGE, 'package.json'), 'utf8'))
     if (pj.version !== OVERLAY.engineVersion) throw new Error(`根包版本 ${pj.version} != 登记表 ${OVERLAY.engineVersion}`)
-    // 解析闸（坑 66）：静态校验引擎树内每个 package.json 的 dependencies 都能在树内解析。
+    // 解析闸（坑 66 + 坑 69）：静态校验引擎树内每个 package.json 的 dependencies 与
+    // peerDependencies（非 optional）都能在树内解析。0.1.7 线包间依赖全走 peer，
+    // 只查 dependencies 会系统性漏判（dsh-session-persistence 缺包实锤）。
     // 模拟 node 逐级向上查找（pkg 自己的 node_modules → 逐级祖先 → 引擎顶层）；
     // 缺失即拒发布——把设备端 ERR_MODULE_NOT_FOUND 砖机转成构建期失败。
     {
@@ -211,10 +224,13 @@ const U = join(STAGE, 'root', 'usr')
       const checkDeps = (pkgDir) => {
         let d
         try { d = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) } catch { return }
-        for (const dep of Object.keys(d.dependencies ?? {})) {
+        const req = { ...(d.dependencies ?? {}) }
+        const optPeers = new Set(Object.entries(d.peerDependenciesMeta ?? {}).filter(([, m]) => m?.optional).map(([k]) => k))
+        for (const [k, s] of Object.entries(d.peerDependencies ?? {})) if (!optPeers.has(k)) req[k] = s
+        for (const dep of Object.keys(req)) {
           gateChecked++
           if (!resolveDep(pkgDir, dep)) {
-            throw new Error(`[解析闸] ${pkgDir.replace(ROOT, '.')} 缺依赖 ${dep}——引擎树不完整，拒绝发布（坑 66）`)
+            throw new Error(`[解析闸] ${pkgDir.replace(ROOT, '.')} 缺依赖 ${dep}——引擎树不完整，拒绝发布（坑 66/69）`)
           }
         }
       }
