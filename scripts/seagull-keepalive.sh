@@ -36,8 +36,12 @@ log() {
   [ "$SZ" -gt 102400 ] && tail -n 200 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
 }
 
-# 单实例锁：发现除自身外的脚本实例即退出（防 service.d 开机实例与手动 install 叠加）
-for P in $(pgrep -f seagull-keepalive.sh 2>/dev/null); do
+# 单实例锁：pgrep 模式锚定整条 cmdline「<sh> /data/adb/service.d/seagull-keepalive.sh」，
+# 解释器两种形态都收（sh <path> 与 shebang 直执行的 /system/bin/sh <path>）。
+# 启动包裹（su -c nohup sh <脚本>...）与探测命令自身（sh -c "...脚本路径..."）的 cmdline
+# 虽含脚本路径但形态不同——锚定后均不假匹配。
+# 坑 67：旧版无锚定，新实例被自家启动器（sleep 1 存活窗口内）判为已有实例，启动即自毁。
+for P in $(pgrep -f '^(sh|/system/bin/sh) /data/adb/service\.d/seagull-keepalive\.sh$' 2>/dev/null); do
   [ "$P" != "$$" ] && exit 0
 done
 

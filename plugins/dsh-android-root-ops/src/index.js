@@ -15,9 +15,9 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 const execFileAsync = promisify(execFile);
@@ -134,8 +134,12 @@ log() {
   [ "$SZ" -gt 102400 ] && tail -n 200 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
 }
 
-# 单实例锁：发现除自身外的脚本实例即退出（防 service.d 开机实例与手动 install 叠加）
-for P in $(pgrep -f seagull-keepalive.sh 2>/dev/null); do
+# 单实例锁：pgrep 模式锚定整条 cmdline「<sh> /data/adb/service.d/seagull-keepalive.sh」，
+# 解释器两种形态都收（sh <path> 与 shebang 直执行的 /system/bin/sh <path>）。
+# 启动包裹（su -c nohup sh <脚本>...）与探测命令自身（sh -c "...脚本路径..."）的 cmdline
+# 虽含脚本路径但形态不同——锚定后均不假匹配。
+# 坑 67：旧版无锚定，新实例被自家启动器（sleep 1 存活窗口内）判为已有实例，启动即自毁。
+for P in $(pgrep -f '^(sh|/system/bin/sh) /data/adb/service\.d/seagull-keepalive\.sh$' 2>/dev/null); do
   [ "$P" != "$$" ] && exit 0
 done
 
@@ -299,9 +303,10 @@ function createKeepalive() {
 
   async function probeAllowlist() {
     try {
-      const r = await runSu(['-c', `cat ${KSU_ALLOWLIST} 2>/dev/null || cat ${KSU_DENYLIST} 2>/dev/null || true`], { timeout: 15000, silent: true });
-      const text = r.stdout || '';
-      allowlisted = text.split('\n').some((line) => line.trim() === PKG);
+      // 只认 allowlist 命中为「已授权」；denylist 是黑名单语义（本应用在名单里 = 被拒），
+      // 旧版把 denylist 命中也当 allowlisted 属语义反转（坑 67 审计），已撤。
+      const r = await runSu(['-c', `grep -qxF '${PKG}' ${KSU_ALLOWLIST} 2>/dev/null && echo IN || echo OUT`], { timeout: 15000, silent: true });
+      allowlisted = (r.stdout || '').includes('IN');
     } catch {
       allowlisted = false;
     }
@@ -311,21 +316,23 @@ function createKeepalive() {
   /**
    * 保活自愈：root 可用且本应用不在 KernelSU allowlist 时，主动把包名写入授权名单，
    * 免去后续每次 root 调用的系统弹窗确认（保活的本质 = root 通道持续免打扰可用）。
-   * KernelSU .allowlist 为一行一个包名；denylist 模式（MagiskSU 语义）写入对应名单。
+   * KernelSU .allowlist 为一行一个包名。坑 67 审计修正：① 只写 allowlist——回退写
+   * denylist 会把本应用拉黑（语义反转）；② 写后必须重读校验——su 进程退出码不反映
+   * 文件写入结果，旧版 `|| true` 时代恒报成功。
    */
   async function ensureAllowlist() {
     const ok = await probeRoot();
     if (!ok) return { ok: false, allowlisted };
     const al = await probeAllowlist();
     if (al) return { ok: true, allowlisted: true, changed: false };
-    // 尝试写 allowlist；写不进去（只读/非 KSU）则回退 denylist，都失败仅记录不抛。
-    const target = KSU_ALLOWLIST;
-    const w = await runSu(['-c', `echo '${PKG}' >> ${target} 2>/dev/null || echo '${PKG}' >> ${KSU_DENYLIST} 2>/dev/null || true`], { timeout: 15000, silent: true });
-    if (w.ok) {
+    const w = await runSu(['-c',
+      `echo '${PKG}' >> ${KSU_ALLOWLIST} 2>/dev/null; grep -qxF '${PKG}' ${KSU_ALLOWLIST} 2>/dev/null && echo ALLOW_OK`,
+    ], { timeout: 15000, silent: true });
+    if ((w.stdout || '').includes('ALLOW_OK')) {
       allowlisted = true;
       return { ok: true, allowlisted: true, changed: true };
     }
-    return { ok: false, allowlisted, changed: false, error: w.error || 'allowlist 写入失败' };
+    return { ok: false, allowlisted, changed: false, error: 'allowlist 写入未生效（只读或非 KernelSU 环境）' };
   }
 
   return {
@@ -628,24 +635,53 @@ function tools(keepalive) {
   // 核心逻辑模块级（工具 execute 与 apply 自动安装钩子共用同一实现）。
   const KA_SVC = '/data/adb/service.d/seagull-keepalive.sh';
   const KA_LOG = '/data/adb/seagull-keepalive.log';
+  // 坑 67：pgrep -f 模式必须锚定整条 cmdline（循环实例 argv 为「<sh> <SVC>」，双解释器形态都收）。
+  // 无锚定时，承载探测/清理命令的 su -c / sh -c 进程自身 cmdline 含脚本路径 → 自匹配：
+  // probe/verify/status 恒报 running（假阳性），kill 连自杀（uninstall 中断）。
+  const KA_PAT = '^(sh|/system/bin/sh) /data/adb/service\\.d/seagull-keepalive\\.sh$';
 
-  async function installKeepalive() {
-    // 0) 幂等探测：脚本在场且实例在跑 → 直接返回
+  // opt-out 标记：keepalive_uninstall 后自动装配钩子不得在 120s 内把卸载撤销（坑 67 审计）。
+  // 落 app 侧 home（无 root 可写可判），应用数据被清时随之消失 = 恢复默认开。
+  function keepaliveOptOutPath() {
+    return process.env.DSH_KEEPALIVE_OPTOUT ?? join(process.env.HOME ?? '', '.dsh', 'keepalive.optout');
+  }
+  function isOptedOut() {
+    try { return readFileSync(keepaliveOptOutPath(), 'utf8').trim().length > 0; } catch { return false; }
+  }
+  function setOptOut(on) {
+    try {
+      if (on) {
+        mkdirSync(dirname(keepaliveOptOutPath()), { recursive: true });
+        writeFileSync(keepaliveOptOutPath(), `disabled at ${new Date().toISOString()}\n`);
+      } else {
+        try { unlinkSync(keepaliveOptOutPath()); } catch { /* 不在场即已关闭 */ }
+      }
+    } catch { /* fs 失败不影响主流程 */ }
+  }
+
+  async function installKeepalive(auto = false) {
+    // 0) opt-out 闸：自动装配遇标记直接跳过（显式调用 = 重新启用，清标记继续装）。
+    if (isOptedOut()) {
+      if (auto) return { ok: false, state: 'opted-out', note: '用户已显式关闭保活（keepalive_uninstall），自动装配跳过。' };
+      setOptOut(false);
+    }
+    // 1) 幂等探测：脚本在场且实例在跑 → 直接返回
     const probe = await runSu(['-c',
-      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f seagull-keepalive.sh | head -n 1); echo SCRIPT=$S RUN=$R`,
+      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f '${KA_PAT}' | head -n 1); echo SCRIPT=$S RUN=$R`,
     ], { timeout: 15000, action: 'keepalive-probe' });
     const pm = /SCRIPT=(\w+) RUN=(\d*)/.exec(probe.stdout || '') || [];
     if (pm[1] === 'yes' && pm[2]) {
       return { ok: true, state: 'already-running', pid: Number(pm[2]), note: '保活巡检已在运行，无需重复安装。' };
     }
-    // 1) A 层系统开关直通：Doze 白名单 + 后台 appops（root 替代手动电池引导，幂等）
+    // 2) A 层系统开关直通：Doze 白名单 + 后台 appops（root 替代手动电池引导，幂等）
     const switches = await runSu(['-c',
       `cmd deviceidle whitelist +${PKG} 2>&1; cmd appops set ${PKG} RUN_ANY_IN_BACKGROUND allow 2>&1; echo SWITCHES_DONE`,
     ], { timeout: 20000, action: 'keepalive-switches' });
-    // 2) 清理旧实例（脚本在场但实例不在 → 直接覆盖；实例在 → 走不到这，幂等分支已返回）
-    await runSu(['-c', 'pgrep -f seagull-keepalive.sh | xargs -r kill 2>/dev/null; echo CLEANED'],
+    // 3) 清理旧实例（脚本在场但实例不在 → 直接覆盖；实例在 → 走不到这，幂等分支已返回）。
+    //    锚定模式下 sh -c 自身 cmdline 不匹配模式，kill 不会自杀（坑 67）。
+    await runSu(['-c', `pgrep -f '${KA_PAT}' | xargs -r kill 2>/dev/null; echo CLEANED`],
       { timeout: 15000, action: 'keepalive-clean' });
-    // 3) 落盘权威脚本（base64 避引号地狱；sh -n 校验失败回滚，坑 48 模式）
+    // 4) 落盘权威脚本（base64 避引号地狱；sh -n 校验失败回滚，坑 48 模式）
     const b64 = Buffer.from(KEEPALIVE_SCRIPT, 'utf8').toString('base64');
     const write = await runSu(['-c',
       `mkdir -p /data/adb/service.d; printf '%s' '${b64}' | /system/bin/base64 -d > ${KA_SVC}.new 2>&1` +
@@ -655,12 +691,12 @@ function tools(keepalive) {
     if (!write.ok || !/WROTE/.test(write.stdout || write.stderr || '')) {
       return { ok: false, step: 'write', error: write.error || write.stdout || write.stderr };
     }
-    // 4) 立即启动（nohup 脱离当前 su 会话；日志首行即启动凭据）
+    // 5) 立即启动（nohup 脱离当前 su 会话；日志首行即启动凭据）
     const start = await runSu(['-c', `nohup sh ${KA_SVC} >/dev/null 2>&1 & sleep 1; echo STARTED`],
       { timeout: 15000, action: 'keepalive-start' });
-    // 5) 收敛判据：实例在场（或日志出现 start 行——pgrep 竞态兜底）
+    // 6) 收敛判据：实例在场（或日志出现 start 行——pgrep 竞态兜底）
     const verify = await runSu(['-c',
-      `R=$(pgrep -f seagull-keepalive.sh | head -n 1); L=$(grep -c 'keepalive start' ${KA_LOG} 2>/dev/null || echo 0); echo RUN=$R LOGSTART=$L`,
+      `R=$(pgrep -f '${KA_PAT}' | head -n 1); L=$(grep -c 'keepalive start' ${KA_LOG} 2>/dev/null || echo 0); echo RUN=$R LOGSTART=$L`,
     ], { timeout: 15000, action: 'keepalive-verify' });
     const vm = /RUN=(\d*) LOGSTART=(\d+)/.exec(verify.stdout || '') || [];
     const running = Boolean(vm[1]) || Number(vm[2] || 0) > 0;
@@ -678,17 +714,24 @@ function tools(keepalive) {
 
   async function uninstallKeepalive() {
     const r = await runSu(['-c',
-      `pgrep -f seagull-keepalive.sh | xargs -r kill 2>/dev/null; ` +
+      `pgrep -f '${KA_PAT}' | xargs -r kill 2>/dev/null; ` +
       `rm -f ${KA_SVC} ${KA_SVC}.new ${KA_LOG} ${KA_LOG}.t 2>/dev/null; ` +
       `cmd deviceidle whitelist -${PKG} 2>&1; cmd appops set ${PKG} RUN_ANY_IN_BACKGROUND default 2>&1; echo REMOVED`,
     ], { timeout: 20000, action: 'keepalive-uninstall' });
     const ok = (r.stdout || '').includes('REMOVED');
-    return { ...r, ok, note: ok ? '保活已卸载（实例已停、脚本与日志已删、白名单已撤）。' : '卸载命令未确认，请重试或检查 root 通道。' };
+    // opt-out 落盘：防 120s 自动装配钩子把卸载撤销（坑 67）。仅确认成功才写。
+    if (ok) setOptOut(true);
+    return {
+      ...r, ok, optedOut: isOptedOut(),
+      note: ok
+        ? '保活已卸载（实例已停、脚本与日志已删、白名单已撤），并已关闭自动装配。重新启用请调用 keepalive_install。'
+        : '卸载命令未确认，请重试或检查 root 通道。',
+    };
   }
 
   async function keepaliveStatus() {
     const r = await runSu(['-c',
-      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f seagull-keepalive.sh | head -n 1); ` +
+      `S=$([ -f ${KA_SVC} ] && echo yes || echo no); R=$(pgrep -f '${KA_PAT}' | head -n 1); ` +
       `echo SCRIPT=$S RUN=$R; echo '--- tail ---'; tail -n 20 ${KA_LOG} 2>/dev/null || echo NO_LOG`,
     ], { timeout: 15000, action: 'keepalive-status' });
     const out = r.stdout || '';
@@ -700,6 +743,7 @@ function tools(keepalive) {
       installed,
       running,
       pid: m[2] ? Number(m[2]) : 0,
+      optedOut: isOptedOut(),
       state: !installed ? 'not-installed' : running ? 'running' : 'installed-not-running',
       tail: out.split('--- tail ---')[1]?.trim() || '',
     };
@@ -712,17 +756,18 @@ function tools(keepalive) {
       'checks the app main process every 30s; when alive lowers oom_score_adj to -900 (LMK ' +
       'immunity) and logs cgroup freeze probes; when dead launches the app via am start with ' +
       'exponential backoff. Also adds the package to the Doze whitelist (root path, replaces ' +
-      'manual battery-optimization guidance). Idempotent: skips if already installed and running.',
+      'manual battery-optimization guidance). Idempotent: skips if already installed and running. ' +
+      'Explicit call re-enables after a previous uninstall (clears the opt-out marker).',
     parameters: {},
     output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
-    async execute() { return installKeepalive(); },
+    async execute() { return installKeepalive(false); },
   });
 
   const keepaliveStatusTool = defineTool({
     name: 'keepalive_status',
     description:
-      'Query the keepalive patrol state: script presence, running pid, and the tail of the ' +
-      'patrol log (includes cgroup freeze probes collected for vendor-freezer analysis).',
+      'Query the keepalive patrol state: script presence, running pid, opt-out marker, and the ' +
+      'tail of the patrol log (includes cgroup freeze probes collected for vendor-freezer analysis).',
     parameters: {},
     output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
     async execute() { return keepaliveStatus(); },
@@ -732,7 +777,8 @@ function tools(keepalive) {
     name: 'keepalive_uninstall',
     description:
       'Stop the keepalive patrol, remove the service.d script and the patrol log, and revoke ' +
-      'the Doze-whitelist / background appops grants.',
+      'the Doze-whitelist / background appops grants. Persists an opt-out marker so the ' +
+      'automatic-install hook will not silently reinstall it afterwards.',
     parameters: {},
     output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
     async execute() { return uninstallKeepalive(); },
@@ -767,6 +813,7 @@ export function apply(ctx) {
   // 自动安装 out-of-app 巡检（决策：默认开 + keepalive_uninstall 可关）。独立 interval，
   // 安装成功即自清；探测走 silent 不刷审计。Linux 宿主（CI/本地单测）无 /system/bin/su，
   // runSu 会探活失败自动跳过——钩子天然 no-op，无需环境判断。
+  // auto=true：opt-out 标记在场即跳过（坑 67——否则 uninstall 120s 内被静默撤销）。
   if (timer !== undefined) {
     ctx.effect(() => {
       let disposer;
@@ -774,7 +821,7 @@ export function apply(ctx) {
         try {
           const st = await keepalive.check();
           if (!st.ok) return;
-          const r = await installKeepalive();
+          const r = await installKeepalive(true);
           if (r.ok && disposer) disposer();
         } catch (_e) { /* 下轮重试 */ }
       }, 120000);
