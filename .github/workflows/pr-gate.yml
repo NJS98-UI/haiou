@@ -41,6 +41,12 @@ jobs:
       - name: undo 急救 CLI 副本一致性（坑 68 回归）
         run: |
           node scripts/check-undo-script.mjs
+      # 坑 76：overlay 资产是 dsh-spill-local 的唯一真源。引擎升级后若该文件的上游锚点变了，
+      # 补丁会静默失效（Android 上每个 spill 根又被判 unsafe，清理通道归零），所以在门禁里
+      # 用 --check 断言 Android 分支仍在场、上游原句已被改写。
+      - name: spill-local Android 祖先补丁在场（坑 76 回归）
+        run: |
+          node scripts/patch-spill-local-android.mjs app/src/main/assets/patched/spill-local-index.js --check
       # 插件版本钉门禁（2026-10 第三轮复盘接线）：此前 check-contract.mjs 只存在于手动执行与
       # 文档记载——某插件私自升降 dsh-tools/cordis/schemastery 版本 → 装配期 ERESOLVE/类型崩
       # （坑 41/42 家族复发）且 CI 零拦截。注意其 inserted 仅覆盖 shell-termux/ui-responsive 两项，

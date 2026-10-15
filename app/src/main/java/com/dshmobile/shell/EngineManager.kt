@@ -1002,6 +1002,19 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     // 引擎在本机是单进程，进程内写声明已互斥所有写者——与上游给浏览器 worker 打桩的口径一致。
     applyAssetPatch("patched/node-addon-system-flock.js",
       File(dshPkgs, "node-addon-system/lib/flock.js"))
+    // 坑 76（2026-10-16 真机实锤）：dsh-spill-local 的祖先判据「组可写且无 sticky 即拒绝」来自
+    // 多用户 POSIX 主机的威胁模型，在 Android 上是必然假阳性——/data 与 /data/data 恒 0771
+    // system:system，app 自己的 files/ 也是 0771 本 app uid，于是每个候选 spill root 都被判 unsafe
+    // （真机 home/tmp 下 92 个 dsh-spill-* 目录全跳过、每个进程新建一个却永远回收不了），
+    // 启动清理整条通道空转。补丁只在 process.platform 为 android 时放宽，且按「这个组到底还有
+    // 谁能进」判定：本 app 私有组（gid 等于 euid）或本进程不属于的平台组（uid/gid 小于 10000）
+    // 才算受保护；跨 app 共享组（log、sdcard_rw 等）、别的 app 的组、world 可写一律照旧拒绝。
+    // 真源锚点与 --check 门禁见 scripts/patch-spill-local-android.mjs。引擎树与 profiles 树
+    // 各有一份同内容拷贝，两处都要覆盖（缺的那份 applyAssetPatch 会自行跳过）。
+    applyAssetPatch("patched/spill-local-index.js",
+      File(dshPkgs, "dsh-spill-local/lib/index.js"))
+    applyAssetPatch("patched/spill-local-index.js",
+      File(home, "profiles/node_modules/@deepseek-ai/dsh-spill-local/lib/index.js"))
     // @dsh-android/dsh-client-ui-responsive 是本仓库自持的浏览器插件：official 构建链由
     // scripts/inject-snapshot.py 把 repo 的 lib/client.js 打进 snapshot.tar.xz，但已发布的
     // 快照归档里仍是 0.1.1 slot 契约的旧 bundle（conversation/details 槽位在 0.1.7 已删除，

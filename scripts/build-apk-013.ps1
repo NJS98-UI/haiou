@@ -95,6 +95,10 @@ foreach ($abi in @('arm64')) {
         # undo 移动端适配门禁：非裁剪版（含快捷键行/全局键盘监听）直接拒绝打包
         node (Join-Path $Root "scripts\patch-undo-mobile.mjs") (Join-Path $undo "lib\client.js") --check 2>&1 | Select-Object -First 2
         if ($LASTEXITCODE -ne 0) { Write-Host "undo 移动端裁剪校验失败，拒绝打包（$abi）"; $failed += "[$abi] undo 裁剪校验失败"; continue }
+        # 坑 76 门禁：spill-local 的 Android 祖先判据必须在真源资产里在场——引擎换代后若上游
+        # 锚点漂移，补丁静默失效表现为「每个 spill 根又被判 unsafe、启动清理归零」，只在真机才看得见
+        node (Join-Path $Root "scripts\patch-spill-local-android.mjs") (Join-Path $Root "app\src\main\assets\patched\spill-local-index.js") --check 2>&1 | Select-Object -First 2
+        if ($LASTEXITCODE -ne 0) { Write-Host "spill-local Android 补丁校验失败，拒绝打包（$abi）"; $failed += "[$abi] spill-local 补丁校验失败"; continue }
         Write-Host "== 注入 @dsh-android 插件（$abi）=="
         python (Join-Path $Root "scripts\inject-snapshot.py") $snap (Join-Path $work "snap-injected.tar.xz") @pluginDirs | Select-Object -Last 2
         if ($LASTEXITCODE -ne 0) { Write-Host "插件注入失败，拒绝打包（$abi）"; $failed += "[$abi] inject-snapshot 失败"; continue }

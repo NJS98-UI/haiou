@@ -196,6 +196,18 @@ const U = join(STAGE, 'root', 'usr')
       wsl(`cp "${wslPath(FLOCK_ASSET)}" "${wslPath(FLOCK_DEST)}"`)
       log('  flock 打桩: @deepseek-ai/node-addon-system/lib/flock.js（坑 73）')
     }
+    // 坑 76（2026-10-16 真机实锤）：dsh-spill-local 的祖先判据「组可写且无 sticky 即拒绝」在
+    // Android 恒假阳性（/data 与 /data/data 都是 0771 system:system，app 的 files/ 也带组写位），
+    // 于是启动清理跳过每一个候选 spill 根——真机 home/tmp 下积累 92 个 dsh-spill-* 目录无人回收。
+    // 快照内直接换成仓内 Android 感知版（与壳侧 applyRuntimePatches 用同一真源资产）；
+    // 缺失该包说明依赖树变了，硬失败。重新生成本仓补丁：scripts/patch-spill-local-android.mjs。
+    {
+      const SPILL_ASSET = join(ROOT, 'app', 'src', 'main', 'assets', 'patched', 'spill-local-index.js')
+      const SPILL_DEST = join(ENGINE_NM_STAGE, '@deepseek-ai', 'dsh-spill-local', 'lib', 'index.js')
+      if (!existsSync(SPILL_DEST)) throw new Error(`快照缺 dsh-spill-local（依赖树变了？）: ${SPILL_DEST}`)
+      wsl(`cp "${wslPath(SPILL_ASSET)}" "${wslPath(SPILL_DEST)}"`)
+      log('  spill-local Android 祖先判据: @deepseek-ai/dsh-spill-local/lib/index.js（坑 76）')
+    }
     // 根包本体：只换 lib/ 与 package.json（node_modules 子树 = 全引擎依赖，绝不可动）
     const root = OVERLAY.rootPackage
     const tgz = await overlayTgz(root.name, root.version)
