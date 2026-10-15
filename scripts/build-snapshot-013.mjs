@@ -34,7 +34,9 @@ const MIRRORS = [
 // BFS 自动闭包；无它则 ubuntu-rootfs 解压了也起不来）。+ openjdk-21/apksigner/aapt2
 // 入常驻（APK 逆向/打包链开箱即用，根治「每次现场 apt 下 193MB」；apktool/jadx 走
 // assets 内置 jar 不重复入快照；zipalign 缺失：未对齐 APK 本地可装可跑，列入已知缺口）。
-const TARGETS = ['python', 'python-pip', 'perl', 'ruby', 'ripgrep', 'zip', 'vim', 'openssl', 'openssl-tool', 'zsh', 'socat', 'busybox', 'dpkg', 'termux-exec', 'termux-elf-cleaner', 'termux-keyring', 'android-tools', 'git', 'proot', 'openjdk-21', 'apksigner', 'aapt2']
+// 2026-10-16：+ jq —— dsh-android-linux-env 的 toolchain 探针把 jq 列为期望件（index.ts:46），
+// 快照却从不装它（旧 make-snapshot.sh 有、013 线漏了），真机恒报 jq:false。
+const TARGETS = ['python', 'python-pip', 'perl', 'ruby', 'ripgrep', 'zip', 'vim', 'openssl', 'openssl-tool', 'zsh', 'socat', 'busybox', 'dpkg', 'termux-exec', 'termux-elf-cleaner', 'termux-keyring', 'android-tools', 'git', 'proot', 'openjdk-21', 'apksigner', 'aapt2', 'jq']
 const NEW_PREFIX = '/data/user/0/com.dsharnessmobile.shell/files/usr'
 const OLD_PREFIX = '/data/data/com.termux/files/usr'
 const BASE_DIR = join(ROOT, '.deploy-tmp', ABI === 'arm64' ? 'arm64-base' : 'x64-base')

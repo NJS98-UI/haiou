@@ -179,14 +179,17 @@ function restore(idOrLatest, { pretend = false } = {}) {
 }
 
 /** P1-A4（2026-10 专家审查修复）：restore 前把目标文件当前态捕获为 pre-restore 快照
- * （kind=manual，reason 前缀 pre-restore:）。恢复动作本身失败时仍可回到当下，
- * 不再是「恢复不可逆」的单向门。尽力而为：捕获失败不阻断恢复。 */
+ * （落在 manual 存储目录，kind=pre-restore、reason 前缀 pre-restore:）。恢复动作本身失败时
+ * 仍可回到当下，不再是「恢复不可逆」的单向门。尽力而为：捕获失败不阻断恢复。
+ * id/kind 必须与 manifest 目录名一致（2026-10-16 真机实锤：早期版本只写 time/reason/files，
+ * undo_list 显示 `undefined … undefined [manual] pre-restore:…`，undo_restore mode "id"
+ * 寻不到这两条保护快照——恰是恢复失败时唯一该能回退的对象）。 */
 function capturePreRestore(m, targetId) {
   const { root, blobs } = storeDirs()
   const id = `pre-restore-${targetId}-${Date.now()}`
   const dir = join(root, 'manual', id)
   try {
-    const out = { time: new Date().toISOString(), reason: `pre-restore:${targetId}`, files: [], plugins: [], profileFiles: [] }
+    const out = { id, time: new Date().toISOString(), kind: 'pre-restore', reason: `pre-restore:${targetId}`, files: [], plugins: [], profileFiles: [] }
     mkdirSync(dir, { recursive: true })
     if (m.envVaultRefs) out.envVaultRefs = m.envVaultRefs
     if (m.sensitiveMode) out.sensitiveMode = m.sensitiveMode

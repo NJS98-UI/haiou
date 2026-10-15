@@ -512,10 +512,13 @@ function crashAdvice(reason) {
 }
 
 // ── B6 undo_scan（v0.3.8）：会话文件健康扫描 + 修复 ─────────────────────────
-// DSH 会话 = <home>/sessions/<id>/session.jsonl.zstd，合规布局为多帧 zstd：
+// DSH 会话 = <home>/sessions/<workspace>/<session-id>/<会话文件>，合规布局为多帧 zstd：
 //   frame 1 = header 行（恰好一行 + \n）   frame 2..n = 事件行
 // "单帧"格式违规（整个 JSONL 流压进一帧）曾导致 DSH 崩溃（8/18 复盘根因）。
 // 工具区分 ok / single-frame-violation（可修复）/ corrupt（无法解码）。
+// 文件名随持久化格式换代：0.1.1 线 session.jsonl.zstd → 0.1.7 线 session.v4.jsonl.zstd
+// （真机实锤：只认旧名时 undo_scan 对 6 个真实会话报 scanned 0，整条健康检查成死代码）。
+const SESSION_FILE_RE = /^session(\.v\d+)?\.jsonl\.zstd$/i;
 const ZSTD_MAGIC = 4247762216;
 // 能力检测：Node 22.15+ 才有 zstd Zlib API；Node 20 下为 undefined，B6 走降级提示。
 const zstdCompressSync = typeof zlib.zstdCompressSync === 'function' ? zlib.zstdCompressSync : null;
@@ -634,7 +637,7 @@ function recodeSessionBytes(b) {
   if (re.status !== 'ok') throw new Error(`recode re-analysis failed: ${re.reason}`);
   return out;
 }
-/** 递归收集 <home>/sessions 下所有 session.jsonl.zstd。 */
+/** 递归收集 <home>/sessions 下所有会话 JSONL 文件。 */
 async function walkSessionFiles(cfg) {
   const root = join(cfg.homeDir ?? DSH_HOME, 'sessions');
   const out = [];
@@ -646,7 +649,7 @@ async function walkSessionFiles(cfg) {
     for (const e of entries) {
       const p = join(dir, e.name);
       if (e.isDirectory()) stack.push(p);
-      else if (e.isFile() && e.name.toLowerCase() === 'session.jsonl.zstd') out.push(p);
+      else if (e.isFile() && SESSION_FILE_RE.test(e.name)) out.push(p);
     }
   }
   return out;
@@ -1081,6 +1084,16 @@ async function listSnapshots(cfg) {
       const dir = join(base, entry.name);
       try {
         const snap = await readManifest(dir);
+        // 存量自愈（2026-10-16 真机实锤）：早期 undo-emergency 的 pre-restore 快照只写
+        // time/reason/files，缺 id/kind → undo_list 整行显示 undefined，undo_restore
+        // mode "id" 恰好在最该能回退的保护快照上失寻。目录名就是 id，kind 可由目录名
+        // 前缀/reason/所在存储推断，读取侧补齐（不回写磁盘清单，避免把修复变成改版动作）。
+        if (typeof snap.id !== 'string' || snap.id === '') snap.id = entry.name;
+        if (typeof snap.kind !== 'string' || snap.kind === '') {
+          snap.kind = (entry.name.startsWith('pre-restore-') || String(snap.reason ?? '').startsWith('pre-restore:'))
+            ? 'pre-restore'
+            : (base === cfg.manualDir ? 'manual' : base === cfg.autoDir ? 'auto' : 'legacy');
+        }
         snap._dir = dir;
         snap._store = dirLabel(cfg, base);
         out.push(snap);
@@ -2381,7 +2394,7 @@ export function apply(ctx, config = {}) {
 
   safeEffect(() => registerToolOnce(defineTool({
     name: 'undo_scan',
-    description: 'Scan DSH session files (<home>/sessions/**/session.jsonl.zstd) for health: "ok" (compliant multi-frame layout), "fixable" (single-frame layout violation — the 8/18 crash root cause), or "corrupt" (undecodable / invalid header / bad JSON lines). With quarantine=true, fixable files are repaired in place: original is copied to <undo root>/corrupt-quarantine/ and kept as <file>.bak, then recoded to header frame + event frames with triple verification (round-trip text, per-line JSON, re-analysis); corrupt files are only isolated (copied, never touched). Read-only by default.',
+    description: 'Scan DSH session files (<home>/sessions/**/session[.vN].jsonl.zstd) for health: "ok" (compliant multi-frame layout), "fixable" (single-frame layout violation — the 8/18 crash root cause), or "corrupt" (undecodable / invalid header / bad JSON lines). With quarantine=true, fixable files are repaired in place: original is copied to <undo root>/corrupt-quarantine/ and kept as <file>.bak, then recoded to header frame + event frames with triple verification (round-trip text, per-line JSON, re-analysis); corrupt files are only isolated (copied, never touched). Read-only by default.',
     parameters: {
       quarantine: { type: 'boolean', description: 'Repair fixable files (backup + recode + verify + replace); corrupt files are isolated only. Default false = read-only scan.' },
     },

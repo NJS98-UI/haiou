@@ -35,7 +35,10 @@ const TOOL_REGISTRY = {
     source: 'https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar',
     installPath: join(USR, 'share', 'apktool', 'apktool.jar'),
     sha256: '7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4',
-    description: 'APK decompile & rebuild (jar) — 随 APK 内置，已自动解压',
+    // 事实口径（2026-10-16）：apktool.jar 只在 release 构建由 CI 下载进 assets/tools/，
+    // 本地/调试构建没有该资产 → extractToolAssets 无从解压，installed 恒为 false。
+    // 描述不再宣称「已自动解压」，一律以 list() 的 installed 字段为准。
+    description: 'APK decompile & rebuild (jar) — release APK 内置资产，引擎启动时自动解压；不在场则 tool_install 在线获取（以 installed 字段为准）',
   },
   jadx: {
     tier: 'L1', type: 'archive-zip', install: 'online',
@@ -334,7 +337,7 @@ function buildService() {
 function tools(service) {
   const installTool = defineTool({
     name: 'tool_install',
-    description: 'Install a development tool from the registry. apktool is built-in; jadx/radare2/rizin are online-install (download + sha256 verify + extract).',
+    description: 'Install a development tool from the registry. apktool ships as an APK asset (jar) when the release build includes it; jadx/radare2/rizin are online-install (download + sha256 verify + extract). Use tool_list to check actual installed state.',
     parameters: {
       name: { type: 'string', required: true, description: 'Tool name to install.' },
       force: { type: 'boolean', description: 'Reinstall over the existing tool (delete then re-download).' },
