@@ -33,6 +33,23 @@ const isLink = (p) => { try { return lstatSync(p).isSymbolicLink() } catch { ret
 const asPosix = (p) => p.split(sep).join('/')
 
 const work = join(tmpdir(), `asset-check-${Date.now()}`)
+// 本门禁的靶心就是「软链成员」（坑 47：生成端按链接目标串哈希 vs 壳端同口径），软链不可
+// 创建时它测不到任何东西。Windows 上 symlinkSync 需要管理员或开发者模式，缺权限时以
+// EPERM 崩栈 = 假故障；这里探测一次并显式跳过（Linux / CI 恒可跑）。
+try {
+  const probe = join(work, 'symlink-probe-dir')
+  mkdirSync(probe, { recursive: true })
+  writeFileSync(join(probe, 't'), 'x')
+  symlinkSync('t', join(probe, 'l'))
+  rmSync(work, { recursive: true, force: true })
+} catch (e) {
+  rmSync(work, { recursive: true, force: true })
+  if (e.code === 'EPERM' || e.code === 'ENOSYS' || e.code === 'ENOTSUP' || e.code === 'ERR_FS_EISDIR') {
+    console.log('[check-asset-manifest] SKIP：本环境不能创建软链（' + e.code + '，Windows 需开发者模式/管理员）——门禁测的是软链哈希口径，Linux/CI 上执行')
+    process.exit(0)
+  }
+  throw e
+}
 const top = 'fake-rootfs-top'
 const base = join(work, top)
 const assets = join(work, 'assets')

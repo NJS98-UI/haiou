@@ -11,6 +11,15 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 
+// POSIX-only fixture: it drives the stub with /bin/sh and relies on /tmp resolving to the
+// same place for node and for sh. On Windows node spawns through cmd.exe (where /bin/sh never
+// resolves) and node maps /tmp to <drive>:\tmp while Git's sh maps it to the MSYS temp dir —
+// the sim then fails for reasons unrelated to the script under test. Skip loudly instead.
+if (process.platform === 'win32') {
+  console.log('[sim-boot] SKIP：需 POSIX /bin/sh 与 /tmp 语义（Linux / WSL / CI 上执行）')
+  process.exit(0)
+}
+
 const W = '/tmp/boot-sim'
 rmSync(W, { recursive: true, force: true })
 const DATA = join(W, 'data/data/com.dsharnessmobile.shell/files')

@@ -22,6 +22,22 @@
     { "pkg": "dsh-bash-local", "symbol": "startArgv", "repo": "dsh-shell-termux" },
     { "pkg": "dsh-sandbox", "symbol": "SandboxEnforcement", "repo": "dsh-shell-termux" }
   ],
+  "assetOverlays": [
+    { "asset": "app/src/main/assets/patched/ui-responsive-client.js", "built": "dsh-client-ui-responsive/lib/client.js" }
+  ],
+  "assetOverlayDir": "app/src/main/assets/patched",
+  "assetOverlayReferencedBy": "app/src/main/java/com/dshmobile/shell/EngineManager.kt",
+  "assetOverlayDeadAllowed": ["llm-deepseek-index.js"],
+  "snapshot": {
+    "archive": "app/src/main/assets/snapshot.tar.xz",
+    "pin": "app/src/main/assets/snapshot.sha256"
+  },
+  "engineOverlay": "scripts/engine-overlay.json",
+  "vendorShims": {
+    "assetDir": "app/src/main/assets/vendor-shims",
+    "sourceDir": "scripts/vendor-shims",
+    "referencedBy": "app/src/main/java/com/dshmobile/shell/EngineManager.kt"
+  },
   "clientSlots": {
     "repo": "dsh-client-ui-responsive",
     "slots": ["sidebar", "main", "rightbar", "shell.overlay", "shell.leading"],
@@ -33,7 +49,7 @@
     "keys": ["PATH", "LD_LIBRARY_PATH", "HOME", "PREFIX", "TERMUX_VERSION", "SHELL"]
   },
   "profiles": {
-    "device": "/data/data/com.termux/files/home/.dsh/profiles",
+    "device": "/data/data/com.dsharnessmobile.shell/files/home/.dsh/profiles",
     "patches": ["web/cordis.patch.yml", "headless/cordis.patch.yml"]
   }
 }

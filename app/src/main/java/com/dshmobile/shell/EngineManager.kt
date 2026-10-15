@@ -107,52 +107,121 @@ class EngineManager(private val context: Context, private val pickToken: String?
     try {
       if (dsh.exists()) {
         backup.deleteRecursively()
-        // Upgrade-residue tolerance (v0.12.4): profile node_modules may carry dangling symlinks
-        // pointing at packages that no longer exist (npm layout changes) — copyRecursively's
-        // exists() check on a dangling link throws NoSuchFileException and fails the whole refresh.
-        // Drop broken links before backing up (profiles follow the snapshot; the backup omits them).
-        dsh.walkTopDown().forEach { if (java.nio.file.Files.isSymbolicLink(it.toPath()) && !it.exists()) it.delete() }
-        dsh.copyRecursively(backup)
+        // Only the stripped user-data entries are backed up: profiles/ubuntu-rootfs are
+        // re-extracted from the snapshot and never read back by restoreUserData, so copying them
+        // meant ~450 MB per refresh — and the rootfs dev/fd symlinks into /proc/self/fd made the
+        // copy die with EINVAL, so no refresh ever completed.
+        var backupOk = true
+        for (name in USER_DATA_NAMES) {
+          val src = File(dsh, name)
+          if (src.exists() && !copyUserDataTree(src, File(backup, name))) backupOk = false
+        }
+        if (!backupOk) throw java.io.IOException("user data backup incomplete, aborting refresh")
       }
       val ok = extractSnapshot(onProgress)
       if (!ok) {
-        restoreUserData(backup, dsh)
+        if (restoreUserData(backup, dsh)) backup.deleteRecursively()
         Log.e(TAG, "snapshot refresh: extract failed, kept old runtime")
         return false
       }
       extractToolAssets() // 内置工具/ubuntu rootfs 解压（非致命，失败仅记录）
-      restoreUserData(backup, dsh)
-      backup.deleteRecursively()
+      if (restoreUserData(backup, dsh)) backup.deleteRecursively()
       fingerprintFile().writeText(bundledFingerprint())
       Log.i(TAG, "snapshot refreshed (fingerprint " + bundledFingerprint().take(12) + ")")
       return true
     } catch (t: Throwable) {
       restoreUserData(backup, dsh)
+      // A failed refresh must not leave a second full copy of the runtime data behind (it is
+      // rebuilt from .dsh on the next attempt anyway).
+      backup.deleteRecursively()
       Log.e(TAG, "snapshot refresh failed; kept old runtime", t)
       return false
+    }
+  }
+
+  /** User-data entries the snapshot ships stripped: the only things a refresh has to carry over. */
+  private val USER_DATA_NAMES = listOf(
+    "sessions", "storages", "attachments",
+    ".credentials.yaml", "settings.yaml", ".anonymous-user-id", ".private-layout",
+  )
+
+  /** Engine packages whose android-arm64 prebuilt npm never publishes, replaced by the pure-JS
+   *  shims under assets/vendor-shims/ (see installVendorShims). */
+  private val VENDOR_SHIM_PACKAGES = listOf("node-addon-require-builtin-android-arm64")
+
+  /**
+   * Copy one user-data subtree without ever following a link: symlinks are recreated as symlinks,
+   * directories recurse, regular files are copied, and anything else (socket, fifo, device node)
+   * is skipped. Returns false when something that should have landed did not.
+   * File.copyRecursively instead follows links and reads them — on the engine's rootfs dev/fd
+   * links into /proc/self/fd that throws EINVAL and used to abort the whole snapshot refresh.
+   */
+  private fun copyUserDataTree(src: File, dst: File): Boolean {
+    val sp = src.toPath()
+    val dp = dst.toPath()
+    val attrs = try {
+      Files.readAttributes(sp, java.nio.file.attribute.BasicFileAttributes::class.java,
+        java.nio.file.LinkOption.NOFOLLOW_LINKS)
+    } catch (e: Exception) {
+      Log.e(TAG, "backup: cannot stat $src", e)
+      return false
+    }
+    if (attrs.isSymbolicLink) {
+      try {
+        dst.parentFile?.mkdirs()
+        if (Files.exists(dp)) Files.delete(dp)
+        Files.createSymbolicLink(dp, Files.readSymbolicLink(sp))
+      } catch (e: Exception) {
+        // A link the destination filesystem refuses is not worth failing the refresh over:
+        // nothing in the backed-up set depends on symlinks for correctness.
+        Log.w(TAG, "backup: symlink skipped: $dst (${e.message})")
+      }
+      return true
+    }
+    if (attrs.isDirectory) {
+      dst.mkdirs()
+      var ok = true
+      for (child in src.listFiles() ?: emptyArray()) {
+        if (!copyUserDataTree(child, File(dst, child.name))) ok = false
+      }
+      return ok
+    }
+    if (!attrs.isRegularFile) {
+      Log.i(TAG, "backup: non-regular entry skipped: $src")
+      return true
+    }
+    return try {
+      dst.parentFile?.mkdirs()
+      Files.copy(sp, dp, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+        java.nio.file.StandardCopyOption.COPY_ATTRIBUTES)
+      true
+    } catch (e: Exception) {
+      Log.e(TAG, "backup: copy failed: $src", e)
+      false
     }
   }
 
   /** Restore the snapshot-stripped user data dirs/files (copied back from the backup into private .dsh).
    *  Never throws (Review 2026-08-18 R2): refreshSnapshot's failure branch calls this on a background
    *  thread, so a restore failure must not escape — otherwise the exception kills the thread and the UI
-   *  hangs on "Updating runtime…" with no message. Failures only log; the backup is kept for a retry. */
-  private fun restoreUserData(backup: File, dsh: File) {
-    if (!backup.exists()) return
-    for (name in listOf(
-      "sessions", "storages", "attachments",
-      ".credentials.yaml", "settings.yaml", ".anonymous-user-id", ".private-layout",
-    )) {
+   *  hangs on "Updating runtime…" with no message. Failures only log; the backup is kept for a retry.
+   *  @return true when every entry landed (the caller may then drop the backup). */
+  private fun restoreUserData(backup: File, dsh: File): Boolean {
+    if (!backup.exists()) return true
+    var allOk = true
+    for (name in USER_DATA_NAMES) {
       try {
         val src = File(backup, name)
         if (!src.exists()) continue
         val dst = File(dsh, name)
         if (dst.exists()) dst.deleteRecursively()
-        src.copyRecursively(dst)
+        if (!copyUserDataTree(src, dst)) allOk = false
       } catch (t: Throwable) {
+        allOk = false
         Log.e(TAG, "restore user data failed for $name; backup kept at " + backup.absolutePath, t)
       }
     }
+    return allOk
   }
 
   /** Process-level start guard (MainActivity and EngineService each construct their own EngineManager;
@@ -879,6 +948,10 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
    *    conversation/details slots — the web boot then deadlocks ("N entries did not activate").
    *    scripts/inject-snapshot.py puts the repo build into new snapshots; this patch makes already
    *    published snapshots self-heal.
+   *  - node-addon-system-flock.js: Android platform-gate stub over the addon package's
+   *    lib/flock.js (not a regenerated upstream file — see applyRuntimePatches for why).
+   *  - 目标包可能来自 installEnginePackages()（坑 72：已发布快照缺登记包或整批停在旧引擎线，
+   *    dsh-client-ui-primitives 就在其中）；它必须早于本方法运行，否则 overlay 会报「package absent」。
    *  IMPORTANT (v0.13.5, pit 69 follow-up): every patch file is a FULL-FILE overlay of the
    *  package's lib/index.js, so each asset must be regenerated against the exact bundled dsh
    *  upstream version. The 0.1.1-rc.2-based overlays broke the 0.1.7-rc.2 boot (the stale jsonl
@@ -916,6 +989,13 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       File(dshPkgs, "dsh-session-persistence-jsonl/lib/index.js"))
     applyAssetPatch("patched/fs-local-index.js",
       File(dshPkgs, "dsh-fs-local/lib/index.js"))
+    // 坑 73：@deepseek-ai/node-addon-system 的 flock 入口按 `${platform}-${arch}` 找预编译 .node，
+    // 上游只为 linux/darwin 发布产物；Android 的 Node 报 platform='android'，加载器直接抛
+    // ERR_FLOCK_UNSUPPORTED_PLATFORM。session 写锁（SessionWriteLease）每轮申请都失败 →
+    // 真机表现为每条消息「本轮运行失败 flock is not supported on android-arm64」。
+    // 引擎在本机是单进程，进程内写声明已互斥所有写者——与上游给浏览器 worker 打桩的口径一致。
+    applyAssetPatch("patched/node-addon-system-flock.js",
+      File(dshPkgs, "node-addon-system/lib/flock.js"))
     // @dsh-android/dsh-client-ui-responsive 是本仓库自持的浏览器插件：official 构建链由
     // scripts/inject-snapshot.py 把 repo 的 lib/client.js 打进 snapshot.tar.xz，但已发布的
     // 快照归档里仍是 0.1.1 slot 契约的旧 bundle（conversation/details 槽位在 0.1.7 已删除，
@@ -932,6 +1012,77 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     // 表现为「添加附件」按钮消失）。定向改名而非整文件 overlay：不锁死第三方插件版本。
     renameInFile(File(home, "profiles/web/node_modules/dsh-attachment-formats/lib/client.js"),
       "IconPaperclipOutline16", "IconPaperclipOutlineRegular")
+    // 坑 69 的壳侧自愈：npm 从不发布 node-addon-require-builtin 的 android-arm64 预编译包，
+    // loader 的 optional-package 候选全部落空 → dsh-app-boot 启动即 fatal
+    // 「No usable native binding found」。scripts/build-snapshot-013.mjs 只把 shim 注进**新**快照，
+    // 已发布的 snapshot.tar.xz 里没有 → 全新安装（干净抽取、无历史叠加）必砖。同一份 JS shim
+    // 随 APK 出货，每次启动补装进引擎 node_modules 顶层。
+    installVendorShims(File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules"))
+  }
+
+  /** Published snapshots don't match the engine dependency registry (坑 72): some registered
+   *  packages are absent and others are pinned to an older engine line. assets/engine-packages.json
+   *  lists the delta (name + version) and engine-packages.tar.xz carries those packages keyed by
+   *  their final on-device path. Extracted only while the delta is real, so a snapshot rebuilt past
+   *  it (build-snapshot overlays the whole registry) is left untouched. */
+  private fun installEnginePackages() {
+    // Before the snapshot is on disk there is nothing to top up, and extracting the gap archive
+    // first would seed a partial usr/ tree ahead of the real extraction.
+    if (!engineReady) return
+    val nm = File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules")
+    val manifest = try {
+      context.assets.open("engine-packages.json").bufferedReader().use { it.readText() }
+    } catch (_: Exception) {
+      return // asset-less build: the shipped snapshot already covers the registry
+    }
+    try {
+      val packages = org.json.JSONObject(manifest).getJSONArray("packages")
+      var missing = 0
+      for (i in 0 until packages.length()) {
+        val p = packages.getJSONObject(i)
+        val installed = File(nm, p.getString("name") + "/package.json")
+        val version = if (installed.exists()) {
+          try { org.json.JSONObject(installed.readText()).optString("version") } catch (_: Exception) { "" }
+        } else ""
+        if (version != p.getString("version")) missing++
+      }
+      if (missing == 0) return
+      Log.i(TAG, "engine package gap: " + missing + "/" + packages.length() + " absent, extracting engine-packages.tar.xz")
+      val fd = context.assets.openFd("engine-packages.tar.xz")
+      SnapshotExtractor.extract(context.assets.open("engine-packages.tar.xz"), fd.length, context.filesDir) { _, _ -> }
+      fd.close()
+      Log.i(TAG, "engine packages installed")
+    } catch (t: Throwable) {
+      Log.e(TAG, "engine package install failed", t)
+    }
+  }
+
+  /** Vendored pure-JS shims (assets/vendor-shims/<pkg>/…), installed into the engine's
+   *  node_modules top level so published snapshots self-heal; see 坑 69 above. */
+  private fun installVendorShims(nodeModules: File) {
+    for (pkg in VENDOR_SHIM_PACKAGES) {
+      val dst = File(nodeModules, pkg)
+      try {
+        var changed = false
+        for (name in listOf("package.json", "index.js")) {
+          val asset = "vendor-shims/$pkg/$name"
+          val bytes = try {
+            context.assets.open(asset).use { it.readBytes() }
+          } catch (_: Exception) {
+            Log.w(TAG, "vendor shim asset missing: $asset")
+            continue
+          }
+          val target = File(dst, name)
+          if (target.exists() && target.readBytes().contentEquals(bytes)) continue
+          dst.mkdirs()
+          writeAtomically(target, bytes)
+          changed = true
+        }
+        if (changed) Log.i(TAG, "vendor shim installed: $pkg")
+      } catch (t: Throwable) {
+        Log.e(TAG, "vendor shim install failed: $pkg", t)
+      }
+    }
   }
 
   /** Overwrite-style patch: applies when the target differs from the bundled asset (content
@@ -959,10 +1110,29 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     if (target.exists() && target.readBytes().contentEquals(finalBytes)) return
     try {
       target.parentFile?.mkdirs()
-      target.writeBytes(finalBytes)
+      writeAtomically(target, finalBytes)
       Log.i(TAG, "runtime patch applied/updated: $asset -> $target")
     } catch (e: Exception) {
       Log.e(TAG, "runtime patch failed: $asset", e)
+    }
+  }
+
+  /**
+   * 同分区原子替换：先写 `<target>.tmp` 再 renameTo（POSIX rename(2) 覆盖目标）。
+   * 直接 writeBytes 会先截断文件——进程在截断与写完之间被杀（低内存回收 / 用户划掉
+   * app）就留下一份截断的 index.js 或 client.js，下次引擎加载它即崩，且崩点离根因
+   * 很远（这些补丁只在引擎启动前跑）。rename 不可用时退回直写：宁可承担极小的
+   * 截断窗口，也不放弃补丁（放弃的症状是「附件按钮消失」「插件不加载」）。
+   */
+  private fun writeAtomically(target: File, bytes: ByteArray) {
+    val tmp = File(target.parentFile, target.name + ".tmp")
+    try {
+      tmp.writeBytes(bytes)
+      if (!tmp.renameTo(target)) throw java.io.IOException("renameTo failed")
+    } catch (e: Exception) {
+      tmp.delete()
+      target.writeBytes(bytes)
+      Log.w(TAG, "atomic replace unavailable, fell back to in-place write: " + target + " (" + e.message + ")")
     }
   }
 
@@ -997,34 +1167,22 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     }
   }
 
-  /** Append-style patch (for cordis.patch.yml, keeping the user's existing entries). */
-  private fun applyAssetPatchAppend(asset: String, target: File, marker: String) {
-    if (target.exists() && target.readText().contains(marker)) return
-    try {
-      val content = context.assets.open(asset).bufferedReader().use { it.readText() }
-      target.parentFile?.mkdirs()
-      val existing = if (target.exists()) target.readText() else ""
-      val sep = if (existing.isNotBlank() && !existing.endsWith("\n")) "\n" else ""
-      target.writeText(existing + sep + content)
-      Log.i(TAG, "runtime patch appended: $asset -> $target")
-    } catch (e: Exception) {
-      Log.e(TAG, "runtime patch failed: $asset", e)
-    }
-  }
-
   /**
    * Targeted in-place rename inside a profile plugin bundle: replaces [from]
    * with [to] when present. Idempotent, and unlike a full-file overlay it never
    * clobbers a newer version of a third-party plugin — used for symbols the
    * engine's own package renames under it. Missing target/file is a silent
    * no-op (the plugin is an optional marketplace install).
+   * 写入走 writeAtomically：直接 writeText 会先截断文件，进程在截断与写完之间被杀
+   * （低内存 / 用户划掉 app）就留下一份截断的 client.js，下次引擎加载它即崩——而本
+   * 方法只在引擎启动前跑，崩点离根因很远。
    */
   private fun renameInFile(target: File, from: String, to: String) {
     if (!target.isFile) return
     try {
       val text = target.readText()
       if (!text.contains(from)) return
-      target.writeText(text.replace(from, to))
+      writeAtomically(target, text.replace(from, to).toByteArray(Charsets.UTF_8))
       Log.i(TAG, "runtime rename applied: $from -> $to in $target")
     } catch (e: Exception) {
       Log.e(TAG, "runtime rename failed: $target", e)
@@ -1092,6 +1250,7 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       repairSettingsSeed()
       // 0.13.1 W3/W4：共享目录 README 每次启动刷新（此前只在迁移路径调用，正常启动不落盘）。
       ensurePublicExportRepo(dshDataDir)
+      installEnginePackages()
       applyRuntimePatches()
       // --no-open: the engine must never try to open a desktop browser on Android
       // (the WebView IS the UI). Without it, rc.2's spawn xdg-open on a missing

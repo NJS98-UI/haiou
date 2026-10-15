@@ -1629,10 +1629,17 @@ class MainActivity : ComponentActivity() {
     }
     try { EngineService.instance?.requestShutdown() } catch (_: Exception) {
     }
-    try { engineManager.stopEngine() } catch (_: Exception) {
-    }
-    try { stopService(Intent(this, EngineService::class.java)) } catch (_: Exception) {
-    }
+    // stopEngine 的有界等待最长 5s（SIGTERM → waitFor → destroyForcibly → waitFor），
+    // 与 stopService 的 binder 调用同在主线程上时，上面排队中的 runOnUiThread 根本来不及
+    // 渲染——用户点「关闭」后看到的是界面卡死数秒（顶到 ANR 输入分发阈值）。关闭引擎是
+    // 显式用户动作，无需同步完成：整段移到后台线程。残余竞态（≤5s 内立刻再点启动，后台
+    // stop 可能误杀新进程）由看门狗探活重启自愈。
+    Thread {
+      try { engineManager.stopEngine() } catch (_: Exception) {
+      }
+      try { stopService(Intent(this, EngineService::class.java)) } catch (_: Exception) {
+      }
+    }.start()
     LogCollector.log("dsh-shell", "harness closed via dev options (shutdownToGuide)")
   }
 

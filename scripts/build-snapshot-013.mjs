@@ -183,6 +183,17 @@ const U = join(STAGE, 'root', 'usr')
       wsl(`rm -rf "${wslPath(SHIM_DEST)}" && mkdir -p "${wslPath(SHIM_DEST)}" && cp "${wslPath(join(SHIM_SRC, 'package.json'))}" "${wslPath(join(SHIM_SRC, 'index.js'))}" "${wslPath(SHIM_DEST)}/"`)
       log('  vendor shim: node-addon-require-builtin-android-arm64（JS shim，坑 69）')
     }
+    // 坑 73（2026-10-16 真机实锤）：node-addon-system 的 flock 入口按 `${platform}-${arch}`
+    // 找预编译 .node，上游只为 linux/darwin 发布产物；Android 的 Node 报 platform='android'
+    // → 加载即抛 ERR_FLOCK_UNSUPPORTED_PLATFORM，session 写锁每轮申请失败（每条消息
+    // 「本轮运行失败 flock is not supported on android-arm64」）。快照内直接换成仓内单进程
+    // 打桩——与壳侧 applyRuntimePatches 用同一真源资产，缺失该包说明依赖树变了，硬失败。
+    {
+      const FLOCK_ASSET = join(ROOT, 'app', 'src', 'main', 'assets', 'patched', 'node-addon-system-flock.js')
+      const FLOCK_DEST = join(ENGINE_NM_STAGE, '@deepseek-ai', 'node-addon-system', 'lib', 'flock.js')
+      wsl(`cp "${wslPath(FLOCK_ASSET)}" "${wslPath(FLOCK_DEST)}"`)
+      log('  flock 打桩: @deepseek-ai/node-addon-system/lib/flock.js（坑 73）')
+    }
     // 根包本体：只换 lib/ 与 package.json（node_modules 子树 = 全引擎依赖，绝不可动）
     const root = OVERLAY.rootPackage
     const tgz = await overlayTgz(root.name, root.version)

@@ -1,0 +1,9 @@
+{
+  "name": "node-addon-require-builtin-android-arm64",
+  "version": "0.1.9",
+  "description": "Seagull fork vendored shim: npm publishes no android-arm64 prebuilt for node-addon-require-builtin (坑 69). This pure-JS shim satisfies the loader's optional-package candidate under --expose-internals, which the shell always passes when starting the engine.",
+  "main": "index.js",
+  "os": ["android"],
+  "cpu": ["arm64"],
+  "license": "MIT"
+}

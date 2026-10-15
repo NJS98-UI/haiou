@@ -15,6 +15,13 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
+// POSIX-only fixture（同 sim-boot-script）：桩脚本必须真被 /bin/sh 解释，且 node 与 sh
+// 对 /tmp 的解析要一致。Windows 上 node 经 cmd.exe 起进程（/bin/sh 不可解析）、node 把
+// /tmp 折成 <盘符>:\tmp 而 Git 的 sh 折成 MSYS temp——失败原因与被测脚本无关，故显式跳过。
+if (process.platform === 'win32') {
+  console.log('[sim-keepalive] SKIP：需 POSIX /bin/sh 与 /tmp 语义（Linux / WSL / CI 上执行）')
+  process.exit(0)
+}
 const W = '/tmp/keepalive-sim'
 rmSync(W, { recursive: true, force: true })
 mkdirSync(W, { recursive: true })
