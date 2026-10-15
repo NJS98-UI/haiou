@@ -950,6 +950,12 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
    *    published snapshots self-heal.
    *  - node-addon-system-flock.js: Android platform-gate stub over the addon package's
    *    lib/flock.js (not a regenerated upstream file — see applyRuntimePatches for why).
+   *  - undo-savepoint-index.js / tool-installer-index.js / seagull-persona.md /
+   *    seagull-persona-core.md: this repository's own (vendored) plugin artifacts, overlaid into
+   *    profiles/{web,headless} so shipped fixes do not wait for a snapshot rebuild (pit 75:
+   *    versioned session file names, an apktool "already extracted" claim that was never true,
+   *    and activation words that fired on any message merely containing hi/hello/你好).
+   *    contract.json assetOverlays pins each asset to its repo source byte-for-byte.
    *  - 目标包可能来自 installEnginePackages()（坑 72：已发布快照缺登记包或整批停在旧引擎线，
    *    dsh-client-ui-primitives 就在其中）；它必须早于本方法运行，否则 overlay 会报「package absent」。
    *  IMPORTANT (v0.13.5, pit 69 follow-up): every patch file is a FULL-FILE overlay of the
@@ -1004,6 +1010,25 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     for (profile in listOf("web", "headless")) {
       applyAssetPatch("patched/ui-responsive-client.js",
         File(home, "profiles/$profile/node_modules/@dsh-android/dsh-client-ui-responsive/lib/client.js"))
+    }
+    // 坑 75：已发布快照里这三件本仓自持产物带着「只在真机暴露」的缺陷——
+    //  · dsh-undo-savepoint：walkSessionFiles 只认 session.jsonl.zstd，而 0.1.7 持久化线的
+    //    真机文件名是 session.v4.jsonl.zstd → undo_scan 恒报 scanned 0，会话健康检查成死代码；
+    //  · dsh-android-tool-installer：注册表描述宣称 apktool「随 APK 内置，已自动解压」，但
+    //    assets/tools 下的 jar 只有 release CI 才下载 → 装机一边说已解压一边 installed:false；
+    //  · dsh-android-seagull：persona 的激活词表按「消息包含」触发固定应答，而 hi/hello/你好/ctf
+    //    全是泛词 → 「帮我看看 hello world 哪错了」也被顶回一行台词（现改为整句判据）。
+    // 与 ui-responsive 同一条纪律：APK 是真源、每次启动按内容指纹自愈，CI 从源重建出的
+    // 新快照与这些资产同内容，指纹一致即跳过，不会反复重写。
+    for (profile in listOf("web", "headless")) {
+      val nm = File(home, "profiles/$profile/node_modules")
+      applyAssetPatch("patched/undo-savepoint-index.js", File(nm, "dsh-undo-savepoint/lib/index.js"))
+      applyAssetPatch("patched/tool-installer-index.js",
+        File(nm, "@dsh-android/dsh-android-tool-installer/lib/index.js"))
+      applyAssetPatch("patched/seagull-persona.md",
+        File(nm, "@dsh-android/dsh-android-seagull/persona.md"))
+      applyAssetPatch("patched/seagull-persona-core.md",
+        File(nm, "@dsh-android/dsh-android-seagull/persona-core.md"))
     }
     // dsh-attachment-formats（市场安装的 profile 插件，不在引擎依赖图里）仍用 0.1.1
     // primitives 的图标名 IconPaperclipOutline16；dsh 0.1.7 primitives 改名为

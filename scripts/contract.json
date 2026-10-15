@@ -23,7 +23,11 @@
     { "pkg": "dsh-sandbox", "symbol": "SandboxEnforcement", "repo": "dsh-shell-termux" }
   ],
   "assetOverlays": [
-    { "asset": "app/src/main/assets/patched/ui-responsive-client.js", "built": "dsh-client-ui-responsive/lib/client.js" }
+    { "asset": "app/src/main/assets/patched/ui-responsive-client.js", "built": "dsh-client-ui-responsive/lib/client.js" },
+    { "asset": "app/src/main/assets/patched/tool-installer-index.js", "built": "plugins/dsh-android-tool-installer/lib/index.js" },
+    { "asset": "app/src/main/assets/patched/seagull-persona.md", "built": "plugins/dsh-android-seagull/persona.md" },
+    { "asset": "app/src/main/assets/patched/seagull-persona-core.md", "built": "plugins/dsh-android-seagull/persona-core.md" },
+    { "asset": "app/src/main/assets/patched/undo-savepoint-index.js", "built": "vendor/dsh-undo-savepoint/lib/index.js" }
   ],
   "assetOverlayDir": "app/src/main/assets/patched",
   "assetOverlayReferencedBy": "app/src/main/java/com/dshmobile/shell/EngineManager.kt",
