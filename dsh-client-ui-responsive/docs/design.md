@@ -87,6 +87,12 @@
 
 ### 4.2 三块容器的移动化（照搬内容，换容器）
 
+> **0.1.7 契约更名（2026-10-15 迁移，见协调仓 AGENTS.md 坑 70）**：本表按 0.1.1 槽位名写成，是设计史实。
+> 上游 0.1.7 删除了 `conversation`/`details` 两个槽位：中心区改为 keyed 的 `main` 槽（每面板一个 entry，
+> `ctx.layout.selectPanel()` 切换，`entryKey` 取 `panelInfo.activePanelId`），右栏改叫 `rightbar`
+> （`openRightbar(track, fullscreen)` / `closeRightbar()`），另有 `shell.leading`。容器与交互语义不变，
+> 只换名字；代码里的 sheet 仍沿用 details 宽度偏好（`panels.details`）作为「是否展示」的载体。
+
 | 槽位 | Wide/Narrow（原样） | Mobile（新容器） |
 |---|---|---|
 | `sidebar` | 三栏内 | **左抽屉**：fixed/absolute 280–320px，`translateX(-100%)` 隐藏 → 0 滑入；配套全屏遮罩（点遮罩关闭）；内容 = 原 sidebar 组件（会话列表/工作区/设置）零改动 |

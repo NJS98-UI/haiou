@@ -863,15 +863,35 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
    * locations (idempotent). Overlayed fixes (all marked by a sentinel string in the target file,
    * so they are re-applied automatically after a snapshot refresh/re-extract):
    *  - primitives-index.js: clipboard fallback for WebViews where navigator.clipboard is denied
-   *  - attachment-local-index.js: Android link(2) blocked by sepolicy → copyFile fallback + EACCES tolerance
+   *    (androidBridge.copyText, then execCommand) + streaming-math KaTeX rendering
+   *  - attachment-local-index.js: Android link(2) blocked by sepolicy → rename fallback +
+   *    ancestor syncDirectory EACCES/EPERM tolerance (sharp loading is native-lazy since rc.2)
    *  - web-frontend-index.html: immersive viewport-fit=cover patch
-   *  - llm-deepseek: NOT patched — dsh 0.1.1-rc.2 bundles deepseek-v4-flash-vision-exp natively
+   *  - llm-deepseek: NOT patched — dsh bundles deepseek-v4-flash-vision-exp natively
    *    with the corrected image-request serialization (see applyRuntimePatches).
    *  - session-persistence-jsonl-index.js / fs-local-index.js: Android link(2) fallback — dsh
    *    0.1.1-rc.1 dropped the EACCES/EPERM/ENOTSUP → rename fallback that rc.8 shipped; Android
    *    app domains forbid link(2) (sepolicy), re-add it as a full-file overlay (as in rc.8).
+   *  - ui-responsive-client.js: this repository's own browser plugin
+   *    (@dsh-android/dsh-client-ui-responsive), overlaid into profiles/{web,headless} so the APK
+   *    is the single source of truth for it. Without this overlay a fresh install re-extracts the
+   *    release snapshot, which still ships the pre-0.1.7 bundle using the removed
+   *    conversation/details slots — the web boot then deadlocks ("N entries did not activate").
+   *    scripts/inject-snapshot.py puts the repo build into new snapshots; this patch makes already
+   *    published snapshots self-heal.
+   *  IMPORTANT (v0.13.5, pit 69 follow-up): every patch file is a FULL-FILE overlay of the
+   *  package's lib/index.js, so each asset must be regenerated against the exact bundled dsh
+   *  upstream version. The 0.1.1-rc.2-based overlays broke the 0.1.7-rc.2 boot (the stale jsonl
+   *  overlay imported DEFAULT_PREPARED_SESSION_CACHE_SIZE, removed from dsh-session-persistence
+   *  since 0.1.3 — "session-persistence-jsonl: failed to import" cascade). Current baseline:
+   *  dsh 0.1.7-rc.2 (regenerated 2026-10-15 by re-applying the fork deltas onto the registry
+   *  tarballs' lib/index.js).
    *  Patches use a content fingerprint (no fixed marker), so an updated asset re-applies on
    *  upgrade instead of being skipped by a stale marker string (the v1→v2 update bug).
+   *  Besides the overlay patches, applyRuntimePatches also carries one targeted in-place
+   *  rename (renameInFile) for the optional marketplace plugin dsh-attachment-formats, whose
+   *  browser bundle still asks primitives for the pre-0.1.7 icon name (React #130 in the
+   *  conversation.input.left slot). In-place, not an overlay: it must not pin that plugin.
    * (v0.12.4 rc8 removed the onImagePicked/llm-deepseek/textzoom patches — rc8's native image
    * request support and no-cache hardening supersede them.)
    */
@@ -896,6 +916,22 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       File(dshPkgs, "dsh-session-persistence-jsonl/lib/index.js"))
     applyAssetPatch("patched/fs-local-index.js",
       File(dshPkgs, "dsh-fs-local/lib/index.js"))
+    // @dsh-android/dsh-client-ui-responsive 是本仓库自持的浏览器插件：official 构建链由
+    // scripts/inject-snapshot.py 把 repo 的 lib/client.js 打进 snapshot.tar.xz，但已发布的
+    // 快照归档里仍是 0.1.1 slot 契约的旧 bundle（conversation/details 槽位在 0.1.7 已删除，
+    // 旧 bundle 只会让 web boot 挂死）。overlay 让 APK 成为该插件的唯一真源：一次注入、
+    // 每次启动自愈，web/headless 两个 profile 都要覆盖（headless 供 CLI 侧解析）。
+    for (profile in listOf("web", "headless")) {
+      applyAssetPatch("patched/ui-responsive-client.js",
+        File(home, "profiles/$profile/node_modules/@dsh-android/dsh-client-ui-responsive/lib/client.js"))
+    }
+    // dsh-attachment-formats（市场安装的 profile 插件，不在引擎依赖图里）仍用 0.1.1
+    // primitives 的图标名 IconPaperclipOutline16；dsh 0.1.7 primitives 改名为
+    // <Icon>Outline{Regular,Medium}（尺寸改由 size 属性表达）。解构得到 undefined →
+    // jsx(undefined) → React #130，conversation.input.left 槽位崩（被槽位错误边界吞掉，
+    // 表现为「添加附件」按钮消失）。定向改名而非整文件 overlay：不锁死第三方插件版本。
+    renameInFile(File(home, "profiles/web/node_modules/dsh-attachment-formats/lib/client.js"),
+      "IconPaperclipOutline16", "IconPaperclipOutlineRegular")
   }
 
   /** Overwrite-style patch: applies when the target differs from the bundled asset (content
@@ -973,6 +1009,25 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       Log.i(TAG, "runtime patch appended: $asset -> $target")
     } catch (e: Exception) {
       Log.e(TAG, "runtime patch failed: $asset", e)
+    }
+  }
+
+  /**
+   * Targeted in-place rename inside a profile plugin bundle: replaces [from]
+   * with [to] when present. Idempotent, and unlike a full-file overlay it never
+   * clobbers a newer version of a third-party plugin — used for symbols the
+   * engine's own package renames under it. Missing target/file is a silent
+   * no-op (the plugin is an optional marketplace install).
+   */
+  private fun renameInFile(target: File, from: String, to: String) {
+    if (!target.isFile) return
+    try {
+      val text = target.readText()
+      if (!text.contains(from)) return
+      target.writeText(text.replace(from, to))
+      Log.i(TAG, "runtime rename applied: $from -> $to in $target")
+    } catch (e: Exception) {
+      Log.e(TAG, "runtime rename failed: $target", e)
     }
   }
 

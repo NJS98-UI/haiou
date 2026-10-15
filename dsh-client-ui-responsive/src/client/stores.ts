@@ -1,17 +1,19 @@
 /**
  * The root entry's transient layout store: panel geometry as plain widths in
- * px (0 = closed). Module level exports the factory only — a module-level
+ * px (0 = closed), the right panel's reported presentation, and the central
+ * panel selection. Module level exports the factory only — a module-level
  * handle would pin the store's identity in the module
  * cache (a de-facto singleton surviving plugin reloads). register() receives
  * the factory (exclusive use: the framework instantiates per entry), AppFrame
  * derives its PropsStore share from the return type, and the service face
  * receives the bound actions through the registration's inject hook.
  */
-import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-runtime/client'
+import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-store'
 import {
   clampWidth, DETAILS_DEFAULT, DETAILS_MAX, DETAILS_MIN,
   SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
 } from './columns.ts'
+import type { MainPanelId } from './service.ts'
 
 /**
  * Layout store state: panel width preferences in px (0 = closed), plus the
@@ -19,10 +21,25 @@ import {
  * (viewport < SIDEBAR_AUTO_COLLAPSE) so toggleSidebar can pick semantics, and
  * `narrowExpanded` is the manual override that re-expands the auto-collapsed
  * sidebar over the squeezed center without rewriting the width preference.
+ *
+ * The 0.1.7 right-column facts (`rightbar*`) are reported BY the occupant
+ * through ctx.layout and only read here: the frame sizes the track and places
+ * the resize handle from them. `panelInfo` is nested so the shared root source
+ * keeps a stable identity until the selection actually changes.
  */
 type LayoutState = {
+  /** Mutable twin of {@link PanelInfo}: the published face is read-only. */
+  panelInfo: { activePanelId: MainPanelId | null }
   sidebar: number
   details: number
+  /** Whether the right panel is drawn at all (reported by its occupant). */
+  rightbarShown: boolean
+  /** Whether the normal panel width reserves a grid track (reported). */
+  rightbarTrack: boolean
+  /** Reported fullscreen presentation; hides the outer resize handle. */
+  rightbarFullscreen: boolean
+  /** Suppress transitions for a fullscreen exit until another geometry action. */
+  rightbarInstant: boolean
   narrow: boolean
   narrowExpanded: boolean
   /** Mobile form active (viewport < MOBILE_BREAKPOINT, fed by AppFrame). */
@@ -41,8 +58,10 @@ type LayoutActions = {
   toggleSidebar: (draft: LayoutState) => void
   setNarrow: (draft: LayoutState, narrow: boolean) => void
   setMobile: (draft: LayoutState, mobile: boolean) => void
-  openDetails: (draft: LayoutState) => void
-  closeDetails: (draft: LayoutState) => void
+  openRightbar: (draft: LayoutState, track: boolean, fullscreen: boolean) => void
+  closeRightbar: (draft: LayoutState) => void
+  selectPanel: (draft: LayoutState, panelId: MainPanelId | null) => void
+  retainMainPanels: (draft: LayoutState, panelIds: readonly string[]) => void
 }
 
 /**
@@ -79,8 +98,36 @@ export const layoutActions: LayoutActions = {
     d.mobile = mobile
     if (mobile) d.drawerOpen = false
   },
-  openDetails: (d) => { if (d.details === 0) d.details = DETAILS_DEFAULT },
-  closeDetails: (d) => { d.details = 0 },
+  /* 0.1.7 layout contract: the right panel reports its presentation through
+     ctx.layout.openRightbar/closeRightbar; `details` stays the width
+     preference (responsive concessions never rewrite it). */
+  openRightbar: (d, track: boolean, fullscreen: boolean) => {
+    if (!d.rightbarShown || d.rightbarTrack !== track || d.rightbarFullscreen !== fullscreen) {
+      d.rightbarInstant = !!(d.rightbarFullscreen && !fullscreen)
+    }
+    // Opening the right panel clears the narrow sidebar re-expand override.
+    if (!d.rightbarShown && d.narrow) d.narrowExpanded = false
+    if (d.details === 0) d.details = DETAILS_DEFAULT
+    d.rightbarShown = true
+    d.rightbarTrack = !!track
+    d.rightbarFullscreen = !!fullscreen
+  },
+  closeRightbar: (d) => {
+    if (!d.rightbarShown) return
+    d.rightbarInstant = !!d.rightbarFullscreen
+    d.rightbarShown = false
+    d.rightbarTrack = false
+    d.rightbarFullscreen = false
+  },
+  /* Central-panel selection: null returns to the Conversation entry. */
+  selectPanel: (d, panelId: MainPanelId | null) => { d.panelInfo.activePanelId = panelId },
+  // A selected panel that has left the live main roster falls back to the
+  // Conversation, so a deregistered occupant can never leave a blank center.
+  retainMainPanels: (d, panelIds: readonly string[]) => {
+    if (d.panelInfo.activePanelId !== null && !panelIds.includes(d.panelInfo.activePanelId)) {
+      d.panelInfo.activePanelId = null
+    }
+  },
 }
 
 /**
@@ -91,11 +138,25 @@ export const layoutActions: LayoutActions = {
  * open/close transitions write 0 / the default explicitly. Below the
  * auto-collapse breakpoint (AppFrame feeds setNarrow) the sidebar toggle
  * flips the narrowExpanded override instead of the preference.
+ * `panelInfo` is nested so the shared root source keeps a stable identity
+ * until the selection actually changes (useSyncExternalStore contract).
  * @returns the store handle (spec + type + identity + factory in one).
  */
-export function createLayoutStore(): EngineStoreHandle<LayoutState, LayoutActions>  {
+export function createLayoutStore(): EngineStoreHandle<LayoutState, LayoutActions> {
   const handle = defineStore({
-    init: (): LayoutState => ({ sidebar: SIDEBAR_DEFAULT, details: 0, narrow: false, narrowExpanded: false, mobile: false, drawerOpen: false }),
+    init: (): LayoutState => ({
+      panelInfo: { activePanelId: null },
+      sidebar: SIDEBAR_DEFAULT,
+      details: 0,
+      rightbarShown: false,
+      rightbarTrack: false,
+      rightbarFullscreen: false,
+      rightbarInstant: false,
+      narrow: false,
+      narrowExpanded: false,
+      mobile: false,
+      drawerOpen: false,
+    }),
     actions: layoutActions,
   })
   return handle

@@ -77,21 +77,29 @@ for (const key of contract.envContract.keys) {
 }
 
 console.log('== 6. 版本钉（package.json vs contract.json） ==')
-// Upstream does not republish every package on each engine train (e.g.
-// dsh-client-runtime has no 0.1.5 line); baselineExceptions pins those
-// per-package so the gate stays meaningful instead of permanently red.
+// baselineExceptions is a per-package escape hatch for upstream packages that do
+// not republish on every engine train; keep it empty when a repo baseline covers
+// everything, so a stale pin fails loudly instead of being silently excused.
+// repoBaselines overrides baseline/cordis per inserted repo: the browser-side
+// plugin tracks the engine's client line (0.1.7-rc.2 / cordis 4.0.4, the version
+// the bundled dsh actually ships), while the node-side shell plugin stays on the
+// line its runtime packages were built against.
 const exceptions = contract.baselineExceptions ?? {}
+const repoOverrides = contract.repoBaselines ?? {}
 for (const repo of contract.inserted.map(i => i.repo)) {
+  const override = repoOverrides[repo] ?? {}
+  const baseline = override.baseline ?? contract.baseline
+  const cordisWant = override.cordis ?? contract.cordis
   const pkg = JSON.parse(readFileSync(join(root, repo, 'package.json'), 'utf8'))
   for (const [dep, pin] of Object.entries(pkg.devDependencies ?? {})) {
     if (!dep.startsWith('@deepseek-ai/dsh-')) continue
-    const want = exceptions[dep] ?? contract.baseline
+    const want = exceptions[dep] ?? baseline
     if (pin !== want) {
       fail(repo + ': ' + dep + ' 钉 ' + pin + ' ≠ 基线 ' + want)
     }
   }
   const cordisPin = pkg.devDependencies?.['@deepseek-ai/cordis'] ?? pkg.peerDependencies?.['@deepseek-ai/cordis']
-  if (cordisPin !== contract.cordis) fail(repo + ': cordis 钉 ' + cordisPin + ' ≠ ' + contract.cordis)
+  if (cordisPin !== cordisWant) fail(repo + ': cordis 钉 ' + cordisPin + ' ≠ ' + cordisWant)
 }
 ok('版本钉检查完成')
 

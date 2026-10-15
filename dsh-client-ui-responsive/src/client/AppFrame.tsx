@@ -10,9 +10,13 @@
  * through the three framework shares — zero cordis or framework imports,
  * zero self-made hooks.
  */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { PropsRenderSlots, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
+// Side-effect type imports: the renderer declares the built-in 'root' slot (and
+// ctx.slots), the session plugin contributes the `useSessions` standard share.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import { computeColumns, MOBILE_BREAKPOINT, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_DEFAULT } from './columns.ts'
 import type { createLayoutStore } from './stores.ts'
 import css from './AppFrame.module.css'
@@ -20,12 +24,22 @@ import css from './AppFrame.module.css'
 /** Full composed props: runtime share + child-slot render share + store share. */
 export type AppFrameProps =
   & PropsRuntime<'root'>
-  & PropsRenderSlots<'sidebar' | 'conversation' | 'details' | 'shell.overlay'>
+  & PropsRenderSlots<'sidebar' | 'main' | 'rightbar' | 'shell.overlay'>
   & PropsStore<ReturnType<typeof createLayoutStore>>
 
 /** Center column grid item (session-body building block). */
 function CenterColumn(props: { children?: ReactNode }) {
   return <div className={css.centerCol}>{props.children}</div>
+}
+
+/**
+ * The keyed `main` occupant sits one level below the column frame so the
+ * panel selection subscription (which changes on every panel switch) never
+ * re-renders the grid, the resize handles or the other columns.
+ */
+function MainPanel(props: Pick<AppFrameProps, 'usePanelInfo' | 'renderSlot'>) {
+  const { usePanelInfo, renderSlot } = props
+  return renderSlot('main', {}, { entryKey: usePanelInfo((info) => info.activePanelId) ?? 'conversation' })
 }
 
 /** Details column grid item; width 0 keeps the subtree mounted (never unmount on close). */
@@ -86,26 +100,13 @@ function DragHandle(props: { side: 'sidebar' | 'details'; left: number; onStart:
 /** The three-column frame (see module doc). */
 export function AppFrame({
   useStore,
-  useSessions,
+  usePanelInfo,
   actions,
   renderSlot,
 }: AppFrameProps) {
   const panels = useStore(s => s)
-  const detailsSession = useSessions((s) => {
-    const current = s.current
-    return current !== undefined && s.byId[current]?.blank === false ? current : undefined
-  })
   const frameRef = useRef<HTMLDivElement | null>(null)
   const [viewport, setViewport] = useState(() => window.innerWidth)
-
-  const lastSession = useRef(detailsSession)
-  useLayoutEffect(() => {
-    if (detailsSession === undefined) return
-    if (lastSession.current !== undefined && lastSession.current !== detailsSession) {
-      actions.closeDetails()
-    }
-    lastSession.current = detailsSession
-  }, [actions, detailsSession])
 
   // Track the frame's own box (not the window): rAF-throttled ResizeObserver.
   useEffect(() => {
@@ -144,7 +145,9 @@ export function AppFrame({
   const sidebarPreference = sidebarCollapsed
     ? 0
     : panels.sidebar === 0 ? SIDEBAR_DEFAULT : panels.sidebar
-  const cols = computeColumns(viewport, sidebarPreference, detailsSession === undefined ? 0 : panels.details)
+  // The right column's normal width only reserves a track while its occupant
+  // reports itself shown; responsive concessions never rewrite the width.
+  const cols = computeColumns(viewport, sidebarPreference, panels.rightbarShown ? panels.details : 0)
   const colsRef = useRef(cols)
   colsRef.current = cols
 
@@ -170,7 +173,7 @@ export function AppFrame({
   // in a left drawer, details in a bottom sheet, conversation full width;
   // shell.overlay stays the top layer (z 20) above drawer (z 10) and mask (z 9).
   if (mobile) {
-    const sheetOpen = detailsSession !== undefined && panels.details > 0
+    const sheetOpen = panels.rightbarShown
     return (
       <div ref={frameRef} className={css.mobileFrame} data-mobile>
         <div className={css.mobileTopBar} data-mobile-topbar>
@@ -183,11 +186,15 @@ export function AppFrame({
           <div className={css.mobileTitle}>DeepSeek Harness</div>
         </div>
         <div className={css.mobileBody}>
-          <CenterColumn>{renderSlot('conversation', {})}</CenterColumn>
+          <CenterColumn><MainPanel usePanelInfo={usePanelInfo} renderSlot={renderSlot} /></CenterColumn>
         </div>
         <div className={css.mobileSheet} data-open={sheetOpen || undefined}>
-          <div className={css.mobileSheetGrab} onClick={() => actions.closeDetails()} />
-          {renderSlot('details', {})}
+          <div className={css.mobileSheetGrab} onClick={() => actions.closeRightbar()} />
+          {renderSlot('rightbar', {
+            width: Math.round(viewport),
+            viewportWidth: viewport,
+            canShow: true,
+          })}
         </div>
         <div className={css.mobileMask} data-open={panels.drawerOpen || undefined} onClick={() => actions.toggleSidebar()} />
         <div className={css.mobileDrawer} data-open={panels.drawerOpen || undefined}>
@@ -223,11 +230,15 @@ export function AppFrame({
       <>
         {/* Both column occupants stay at fixed tree positions from first
             paint — no loading gate: a bare status line reads worse than
-            the shell's own pending rendering. The conversation
-            is session-maybe; the strict details entry naturally renders
-            empty while no session is current. */}
-        <CenterColumn>{renderSlot('conversation', {})}</CenterColumn>
-        <DetailsColumn>{renderSlot('details', {})}</DetailsColumn>
+            the shell's own pending rendering. The keyed main panel is
+            session-maybe; the right column's occupant decides for itself
+            whether to render its Session-bound content. */}
+        <CenterColumn><MainPanel usePanelInfo={usePanelInfo} renderSlot={renderSlot} /></CenterColumn>
+        <DetailsColumn>{renderSlot('rightbar', {
+          width: cols.details,
+          viewportWidth: viewport,
+          canShow: cols.details > 0,
+        })}</DetailsColumn>
       </>
       <div className={css.overlayLayer} data-shell-overlay>
         {renderSlot('shell.overlay', {})}

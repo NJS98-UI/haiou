@@ -1,14 +1,11 @@
 {
   "baseline": "0.1.5-rc.2",
-  "baselineExceptions": {
-    "@deepseek-ai/dsh-client-runtime": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-theme": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-invariants": "0.1.1-rc.2"
-  },
+  "baselineExceptions": {},
   "cordis": "4.0.2",
   "schemastery": "3.18.2",
+  "repoBaselines": {
+    "dsh-client-ui-responsive": { "baseline": "0.1.7-rc.2", "cordis": "4.0.4" }
+  },
   "upstreamRepo": "dsh",
   "rows": [
     { "bundle": "base", "id": "bash-sandbox", "usage": "disabled on android", "expected": "@deepseek-ai/dsh-bash-sandbox" },
@@ -27,7 +24,7 @@
   ],
   "clientSlots": {
     "repo": "dsh-client-ui-responsive",
-    "slots": ["sidebar", "conversation", "details", "shell.overlay"],
+    "slots": ["sidebar", "main", "rightbar", "shell.overlay", "shell.leading"],
     "rowId": "ui-layout",
     "disabledRow": "ui-layout"
   },

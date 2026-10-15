@@ -11,13 +11,13 @@ import org.json.JSONObject
  * would fight for 3080). Kept in one constant so probe/start/URL all agree.
  *
  * 0.1.7 engine contract change (pitfall 69): the web host gates EVERY route
- * (index + /api/*) behind a per-process launch token that rotates on each
- * engine start. The token is only published in the engine.log banner
- * `dsh web: http://127.0.0.1:<port>/?token=<base64url>`. The shell therefore
+ * (index and all api endpoints) behind a per-process launch token that
+ * rotates on each engine start. The token is only published in the engine.log
+ * banner `dsh web: http://127.0.0.1:<port>/?token=<base64url>`. The shell
  * parses the banner (bounded tail read, pitfall 64 family), exchanges the
- * token for the session cookie (GET /?token → 303 + Set-Cookie), and attaches
- * that cookie to every raw HTTP call; the WebView loads the authenticated URL
- * directly so its own cookie jar carries the session.
+ * token for the session cookie (GET with token returns 303 + Set-Cookie), and
+ * attaches that cookie to every raw HTTP call; the WebView loads the
+ * authenticated URL directly so its own cookie jar carries the session.
  */
 object EngineProbe {
 

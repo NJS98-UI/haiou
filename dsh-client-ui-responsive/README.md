@@ -32,24 +32,28 @@ while keeping the Wide/Narrow behavior byte-identical to upstream.
 |---|---|---|
 | Wide | ≥1024px | three columns, upstream behavior |
 | Narrow | 640–1024px | upstream auto-collapse rail + manual re-expand |
-| **Mobile** | <640px | single column: sidebar → left drawer, details → bottom sheet, top bar + hamburger, safe areas |
+| **Mobile** | <640px | single column: sidebar → left drawer, rightbar → bottom sheet, top bar + hamburger, safe areas |
 
 Landscape phones (≥640 logical px) reuse the original Wide/Narrow UI unchanged.
 
 ## Behavior notes
 
-- **Same slots, same services**: `sidebar`/`conversation`/`details`/`shell.overlay` and
-  `ctx.layout` are provided identically to ui-layout — consumers (ui-sidebar, ui-conversation)
-  work unchanged.
-- **Mobile state semantics**: hamburger toggles the drawer (mask tap closes); opening details via
-  `ctx.layout.openDetails()` shows the bottom sheet; `shell.overlay` stays the top layer (z 20).
+- **Same slots, same services**: `sidebar` / `main` / `rightbar` / `shell.overlay` / `shell.leading`
+  plus `ctx.layout` are provided exactly as the upstream 0.1.7 `ui-layout` does, so consumers
+  (ui-sidebar, conversation and tool panels) work unchanged. The 0.1.1 `conversation` / `details`
+  slot names no longer exist upstream: the center area is the keyed `main` slot (one entry per
+  panel, switched with `ctx.layout.selectPanel()`), and the details column is `rightbar`.
+- **Mobile state semantics**: hamburger toggles the drawer (mask tap closes); `ctx.layout.openRightbar(track, fullscreen)`
+  shows the bottom sheet — the same `rightbar` content, no remount; `shell.overlay` stays the top
+  layer (z 20).
 - **Rotation** is instant: the frame switches tiers via the same rAF-throttled ResizeObserver;
   `prefers-reduced-motion` disables transitions.
 
 ## Build
 
 ```sh
-npm install          # baseline pinned to @deepseek-ai/* 0.1.0-rc.6
+npm install          # baseline pinned to the engine's client line, @deepseek-ai/* 0.1.7-rc.2
+                     # (scripts/contract.json → repoBaselines pins the exact versions + cordis 4.0.4)
 npm run build        # tsc (lib/types) + tsdown (lib/client.js browser bundle)
 npm run typecheck
 ```
@@ -57,8 +61,16 @@ npm run typecheck
 The browser bundle uses the `__ModuleLoader__.load` contract; rebuild before probing a live server
 (the registry serves `lib/client.js`, not sources).
 
+The shell APK keeps this bundle as a fingerprinted asset overlay
+(`app/src/main/assets/patched/ui-responsive-client.js`), re-applied into `profiles/{web,headless}`
+on every engine start — so an old published snapshot self-heals instead of booting the pre-0.1.7
+slot contract. **After any change here, run `npm run build` and refresh that asset in the same
+commit.**
+
 ## Testing
 
+- Unit specs: `npm test` (vitest, 10 files / 79 tests) — pure store drafts (three-way toggle,
+  rightbar presentation, panel selection), column solver, and the fork-only client effects.
 - Component specs: host CDP against a served page at 412px (drawer open/close, mask) and 1280px
   (three-column regression) — see the project verification log in the coordination repo.
 - Old-kernel browsers (pre-ES2024 WebView) cannot load the client bundles; use a current WebView
