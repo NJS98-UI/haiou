@@ -82,6 +82,9 @@ jobs:
           # build-snapshot-013.mjs 的 BASE_DIR：arm64 -> arm64-base；x86_64 -> x64-base（缩写，勿写 x86_64-base）
           if [ "$abi" = "arm64" ]; then bdir="arm64-base"; else bdir="x64-base"; fi
           mkdir -p ".deploy-tmp/${bdir}"
+          # base/ 目录本身可能不存在（LFS 指针归档已从库里删掉），curl -o base/x 在无目录时
+          # 报 (23) Failure writing output to destination：先建目录，指针有无都走同一条直连下载。
+          mkdir -p base
           # fork 未上传 LFS 底座对象：base-usr-*.tar.xz 是 133B LFS 指针 → 从上游 media 直连下载真实归档
           if [ ! -s "base/base-usr-${abi}.tar.xz" ] || [ "$(wc -c < base/base-usr-${abi}.tar.xz)" -lt 1000 ]; then
             echo "::warning:: base-usr-${abi}.tar.xz 为 LFS 指针，从上游 kelai141/dsh-mobile-apk 直连下载"
