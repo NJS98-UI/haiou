@@ -404,25 +404,46 @@ class AndroidDirectoryPicker extends Service {
 
   /**
    * Settle one pick. Path validation (M5, 2026-08-16): only real external-workspace paths are
-   * accepted (/storage/emulated/0/ prefix, no `..` segments, non-content://) — raw tree URIs from
-   * non-primary volumes such as SD card/USB are explicitly rejected here (the engine can't use them
-   * as a workspace; error instead of silent pass-through); combined with C1's token fail-closed this
+   * accepted — no `..` segments, no content:// URIs; combined with C1's token fail-closed this
    * removes the forged-path surface.
+   * 坑 81（OTG USB，2026-10-16）：可移动卷（U 盘 / SD）不再是「显式拒绝」的对象。旧规则只认
+   * `/storage/emulated/0/` 前缀，而壳侧对非 primary 卷的 docId（`<卷名>:rel`）当时还原不出真实
+   * 路径，退回 content:// 串 → 这里判无效 → 用户「选了文件夹但什么也没发生」。现在壳侧还原成
+   * `/storage/<卷名>/…`，本函数按挂载点做校验：卷名受字符集约束，且必须**实测存在**
+   * （`existsSync`），拔出后残留的字符串不会被当成工作区。
    */
   resolve(requestId, path) {
     const entry = this.pending.get(requestId)
     if (!entry) return false
     this.pending.delete(requestId)
-    if (typeof path === 'string' && path !== '' &&
-      path.startsWith('/storage/emulated/0/') &&
-      !path.split('/').includes('..') &&
-      !path.includes('\u0000')) {
+    if (isExternalWorkspacePath(path)) {
       entry.resolve(path)
     } else {
       entry.resolve(null) // settle an invalid path as cancelled; don't persist or echo the path
     }
     return true
   }
+}
+
+/**
+ * 外部工作区路径判定（M5 校验的唯一实现，resolve 用）。
+ * 通过条件：绝对路径、无 `..` 段、无 NUL，且落在
+ * ① `/storage/emulated/0/<子目录>`（主外置卷，沿用旧口径：卷根本身不算工作区），或
+ * ② `/storage/<可移动卷名>[/<子目录>]`（OTG U 盘 / SD，坑 81）——卷名限
+ * `[A-Za-z0-9._-]{1,64}` 且挂载点当前真实可见（引擎有 All Files Access 时 stat 得动）。
+ * @param {unknown} path picker 回传的候选路径。
+ * @returns {boolean} 可作为外部工作区。
+ */
+function isExternalWorkspacePath(path) {
+  if (typeof path !== 'string' || path === '') return false
+  if (path.includes('\u0000')) return false
+  const seg = path.split('/')
+  if (seg.includes('..')) return false
+  if (seg[0] !== '' || seg[1] !== 'storage' || seg.length < 3) return false
+  const vol = seg[2]
+  if (vol === 'emulated') return seg[3] === '0' && seg.length >= 5
+  if (vol === 'primary' || vol === 'self' || vol === '.' || !/^[A-Za-z0-9._-]{1,64}$/.test(vol)) return false
+  return existsSync('/storage/' + vol)
 }
 
 export const name = 'host-web-compat';

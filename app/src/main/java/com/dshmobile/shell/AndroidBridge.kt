@@ -26,6 +26,12 @@ class AndroidBridge(
   private val onSetTextZoomRequest: (percent: Int) -> Unit = {},
   private val onSetImmersiveRequest: (enable: Boolean) -> Unit = {},
   private val onCopyTextRequest: (text: String) -> Boolean = { false },
+  /** 0.13.5 坑 81：OTG USB 状态（[UsbState.refresh] 的 JSON 文本）；未接线时给结构化空态。 */
+  private val onGetUsbState: () -> String = {
+    """{"ok":false,"reason":"bridge not wired","devices":[],"count":0,"volumes":[]}"""
+  },
+  /** OTG USB 设备访问授权申请（系统弹窗），返回 JSON {ok, reason, name?}。 */
+  private val onRequestUsbPermission: (String) -> String = { """{"ok":false,"reason":"bridge not wired"}""" },
   private val pickToken: String? = null,
   private val onRestartEngine: () -> Unit = {},
   private val onShutdownToGuide: () -> Unit = {},
@@ -225,6 +231,18 @@ class AndroidBridge(
   @JavascriptInterface
   fun discoverAdbPorts(): String = onDiscoverAdbPorts()
 
+  /**
+   * OTG USB 状态（坑 81）：JSON {ok, hostFeature, devices[], count, volumes[]}。
+   * devices 免授权可枚举；每条带 hasPermission，做 I/O 前要 requestUsbPermission。
+   * volumes 是可移动卷挂载点（`/storage/<UUID>`）与「本 app 域实测可达」判据。
+   */
+  @JavascriptInterface
+  fun getUsbState(): String = onGetUsbState()
+
+  /** 申请某个 USB 设备的访问权限（系统弹窗）；deviceName 取 getUsbState 的 devices[].name。 */
+  @JavascriptInterface
+  fun requestUsbPermission(deviceName: String): String = onRequestUsbPermission(deviceName)
+
   /** 悬浮球开关态（持久化；开发者选项 → 悬浮球）。 */
   @JavascriptInterface
   fun getOverlayEnabled(): Boolean = onGetOverlayEnabled()
@@ -237,22 +255,29 @@ class AndroidBridge(
     /**
      * Map an ACTION_OPEN_DOCUMENT_TREE result onto a Termux-visible real path
      * when possible: "primary:rel/path" -> /storage/emulated/0/rel/path.
-     * Non-primary volumes fall back to the raw content:// tree URI (the page
-     * can still use it as an opaque handle).
+     * 坑 81（OTG USB）：可移动卷的 tree docId 是 `<卷名>:rel`（卷名即挂载点目录名，
+     * 如 `8F3A-1B0C`），旧实现只对 `primary` 做映射，U 盘/SD 一律退回 `content://` 串——
+     * 引擎侧 `resolve()` 只认真实路径，于是选择器看起来「选了没反应」。这里按系统约定
+     * 映射到 `/storage/<卷名>/rel`；`raw:` 前缀（部分 ROM 把整卷当本地目录暴露）直接取后半段。
+     * 卷名字符集与「挂载点是否真存在」的把关放在引擎侧（dsh-host-web-compat `resolve()`），
+     * 这里只负责还原路径，绝不做路径清洗之外的猜测。
      * @param uri the tree URI from the system picker.
      * @returns the mapped real path or the original URI string.
      */
     fun resolvePickedPath(uri: Uri): String {
       return try {
         val docId = DocumentsContract.getTreeDocumentId(uri)
+        // raw: 前缀只在 /storage 命名空间内还原（引擎侧还会再验一次挂载点存在性）。
+        if (docId.startsWith("raw:/storage/")) return docId.substring(4)
         val idx = docId.indexOf(':')
         val volume = if (idx > 0) docId.substring(0, idx) else ""
         val rel = if (idx > 0) docId.substring(idx + 1) else docId
-        // M5: path sanitization — reject `..` segments/absolute paths (escape prevention); empty rel is rejected.
-        if (rel.isEmpty() || rel.split("/").any { it == ".." } || rel.startsWith("/")) {
-          return uri.toString()
-        }
-        if (volume == "primary") "/storage/emulated/0/$rel" else uri.toString()
+        // M5: path sanitization — reject `..` segments/absolute paths (escape prevention).
+        if (rel.split("/").any { it == ".." } || rel.startsWith("/")) return uri.toString()
+        if (volume == "primary") return if (rel.isEmpty()) uri.toString() else "/storage/emulated/0/$rel"
+        // 可移动卷整卷根（用户在 SAF 里直接「使用此文件夹」）也是合法工作区。
+        if (!volume.matches(Regex("[A-Za-z0-9._-]{1,64}"))) return uri.toString()
+        if (rel.isEmpty()) "/storage/$volume" else "/storage/$volume/$rel"
       } catch (_: Exception) {
         uri.toString()
       }

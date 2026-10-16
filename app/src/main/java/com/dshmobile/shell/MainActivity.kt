@@ -479,6 +479,8 @@ class MainActivity : ComponentActivity() {
       LogCollector.start(this)
       LogCollector.log("dsh-shell", "app onCreate (dev log on)")
     }
+    // 坑 81：OTG USB 接入/拔出广播（幂等，与 EngineService 谁先到谁注册）。
+    UsbState.ensureReceiver(this)
     // 沉浸式：内容延伸到系统栏区域（状态栏常态收起，边缘滑动临时呼出）。
     WindowCompat.setDecorFitsSystemWindows(window, false)
     applyImmersive(immersivePrefs())
@@ -915,6 +917,10 @@ class MainActivity : ComponentActivity() {
         onRevokeAdbPair = { AdbState.revokePair(this, engineManager) },
         // 缓存优先（启动后台预取 + 15s TTL）；无缓存才同步扫——配对页不再卡 UI（2026-08-27 报障修复）。
         onDiscoverAdbPorts = { AdbState.cachedPorts() ?: AdbState.discoverPorts(this, engineManager).toString() },
+        // 0.14 坑 81：外置 OTG USB。设置页轮询这份 JSON（设备枚举 + 可移动卷可达性），
+        // 授权走系统逐设备弹窗（deviceList 免授权可枚举，但 I/O 必须 requestPermission）。
+        onGetUsbState = { UsbState.refresh(this) },
+        onRequestUsbPermission = { name -> UsbState.requestPermission(this, name) },
       ),
       "androidBridge",
     )

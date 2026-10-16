@@ -45,6 +45,8 @@ class EngineService : Service() {
     startForeground(NOTIFICATION_ID, buildNotification())
     // Dev log toggle on: persistent collection (logcat + engine.log → dshdata/log/, daily).
     if (MainActivity.DevLogPrefs.isEnabled(this)) LogCollector.start(this)
+    // 坑 81：服务侧也要注册 OTG 广播——设置页可能从未打开过，引擎环境的 DSH_USB_* 仍要跟着插拔更新。
+    UsbState.ensureReceiver(this)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

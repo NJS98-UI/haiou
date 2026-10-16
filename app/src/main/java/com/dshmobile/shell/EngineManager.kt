@@ -1858,7 +1858,7 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       // 二次冷启动命中，直接缩短 node 冷启 require 树编译时间（K20 Pro 实测每次冷启都慢、
       // 0.13.0 之前全快；缓存目录持久在 home/.dsh 下，随用户数据保留不随快照）。
       "NODE_COMPILE_CACHE" to File(ensurePrivateDshData(), ".node-compile-cache").apply { mkdirs() }.absolutePath,
-    ) + certEnv
+    ) + certEnv + UsbState.env(context)
   }
 
   companion object {

@@ -32,6 +32,7 @@
 | getPickToken | () → String | 目录选择桥一次性会话 token（引擎侧 pick 端点校验；null = 禁用） |
 | copyText | (text) → Boolean | 写入系统剪贴板（WebView clipboard 被拒的回退） |
 | getDevLogEnabled | () → Boolean | dev 日志开关状态 |
+| getUsbState | () → String | OTG USB 状态 JSON（主机能力、设备枚举 + 逐设备授权、可移动卷挂载点可达性）（坑 81） |
 
 **命令**
 
@@ -41,6 +42,7 @@
 | showNotification | (title, text) | 通知测试通道（POST_NOTIFICATIONS 运行时请求） |
 | pickDirectory | (callbackId) | SAF 目录选择（ACTION_OPEN_DOCUMENT_TREE）；结果异步经 `onDirectoryPicked(callbackId, path)` 回 JS |
 | pickImage | (callbackId) | SAF 图片选择；结果同上异步回传 |
+| requestUsbPermission | (deviceName) → String | 向系统申请某 OTG USB 设备的访问权（逐设备弹窗），返回 `{ok, reason}` JSON（坑 81） |
 | setTextZoom | (percent) | WebView 字体缩放 50–200 |
 | setImmersiveMode | (enable) | 沉浸式状态栏开关（true = 状态栏常隐） |
 | downloadDebugLogs | () | 导出引擎日志 + 环境信息（压缩包） |
@@ -52,8 +54,11 @@
 | setDevLogEnabled | (enabled) | 设置 dev 日志开关（开启后写入 `dshdata/log/`） |
 
 **路径映射**（`pickDirectory` 回传）：`content://` tree URI → Termux 可见真实路径：
-`primary:rel/path` → `/storage/emulated/0/rel/path`；非 primary 卷退回原样 `content://`。
-路径做 `..` / 绝对路径净化（防逃逸）。
+`primary:rel/path` → `/storage/emulated/0/rel/path`；可移动卷（OTG U 盘 / SD，坑 81）
+`<卷名>:rel` → `/storage/<卷名>/rel`（整卷根 `<卷名>:` → `/storage/<卷名>`）；`raw:/storage/…`
+直接取后半段；卷名字符集不合法时退回原样 `content://`。
+路径做 `..` / 绝对路径净化（防逃逸），引擎侧 `dsh-host-web-compat` 的 `resolve()` 再校验一次
+（可移动卷必须挂载点真实存在），两侧都只结算合法路径，其余按取消处理。
 
 ## 3. 权限集
 
