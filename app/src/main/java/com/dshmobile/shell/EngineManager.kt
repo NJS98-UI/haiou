@@ -469,11 +469,16 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // 硬编码全量锚点会永不满足 → stamp 匹配也每启动重解（永不收敛的重解风暴）。
     val stampFile = File(context.filesDir, ".toolassets-stamp")
     val stamp = toolAssetsStamp(manifest)
+    // 容器探针（详见 containerProbe）：判死且无 root 通道时，307MB rootfs 解出来也执行不了任何命令
+    // （实测 ubuntu_exec 连 `true` 都是 execve Permission denied）。此时跳过解压，并同步摘掉 rootfs
+    // 锚点——锚点留着会和「被跳过的落点」互相矛盾，退化成每次启动全量重解的重解风暴。
+    // 只「不再重建」，绝不「删除已存在」：用户数据与「一旦 root 立即可用」的余地必须保留。
+    val skipRootfs = hasAsset("ubuntu-rootfs.tar.xz") && containerProbe(manifest).blocked
     val anchors = ArrayList<File>()
     if (hasAsset("tools/apktool.jar")) anchors.add(File(usrDir, "share/apktool/apktool.jar"))
     if (hasAsset("native/liboperit_proot.so")) anchors.add(File(operitNativeDir, "proot"))
     if (hasAsset("native/liboperit_loader.so")) anchors.add(File(operitNativeDir, "loader"))
-    if (hasAsset("ubuntu-rootfs.tar.xz")) {
+    if (hasAsset("ubuntu-rootfs.tar.xz") && !skipRootfs) {
       anchors.add(File(homeDir, ".dsh/ubuntu-rootfs/proot-entry.sh"))
       anchors.add(File(homeDir, ".dsh/ubuntu-rootfs/bin/bash"))
     }
@@ -492,14 +497,18 @@ class EngineManager(private val context: Context, private val pickToken: String?
       copyAssetToStaged("tools/apktool.jar", File(stUsr, "share/apktool/apktool.jar"))
       copyAssetToStaged("native/liboperit_proot.so", File(stNative, "proot")).setExecutable(true, false)
       copyAssetToStaged("native/liboperit_loader.so", File(stNative, "loader")).setExecutable(true, false)
-      extractTarAsset("ubuntu-rootfs.tar.xz", stRootfs, "xz", stripTopDir = true)
-      writeProotEntry(File(stRootfs, "proot-entry.sh"))
+      if (skipRootfs) {
+        Log.i(TAG, "ubuntu rootfs extraction SKIPPED: container probe judged execve blocked and no su chroot (re-probed every start)")
+      } else {
+        extractTarAsset("ubuntu-rootfs.tar.xz", stRootfs, "xz", stripTopDir = true)
+        writeProotEntry(File(stRootfs, "proot-entry.sh"))
+      }
       // 2) 核验：资产本体哈希（逐字节 copy 项）+ rootfs 抽检成员/统计（防解一半）。
       verifyAssetHashes(manifest, staging)
-      verifyRootfs(manifest, stRootfs)
+      if (!skipRootfs) verifyRootfs(manifest, stRootfs)
       // 3) 进位：逐路径递归合并（staging 树 → usr/home，引擎树与用户数据分毫不动）。
       promoteTree(stUsr, usrDir)
-      promoteTree(stHome, homeDir)
+      if (!skipRootfs) promoteTree(stHome, homeDir)
       staging.deleteRecursively()
       // 4) 成功才盖章——失败/中断的路径永远不写 stamp。
       stampFile.writeText(stamp + "\n")
@@ -519,8 +528,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val rootfsBash = File(homeDir, ".dsh/ubuntu-rootfs/bin/bash")
     val operitProot = File(operitNativeDir, "proot")
     val operitLoader = File(operitNativeDir, "loader")
-    if (apkJar.exists() && prootEntry.exists() && rootfsBash.exists() &&
-        operitProot.exists() && operitLoader.exists()) {
+    val skipRootfs = hasAsset("ubuntu-rootfs.tar.xz") && containerProbe(null).blocked
+    if (apkJar.exists() && operitProot.exists() && operitLoader.exists() &&
+        (skipRootfs || (prootEntry.exists() && rootfsBash.exists()))) {
       return true
     }
     return try {
@@ -529,13 +539,163 @@ class EngineManager(private val context: Context, private val pickToken: String?
       copyAssetToFile("native/liboperit_loader.so", operitLoader)
       operitProot.setExecutable(true, false)
       operitLoader.setExecutable(true, false)
-      extractTarAsset("ubuntu-rootfs.tar.xz", File(homeDir, ".dsh/ubuntu-rootfs"), "xz", stripTopDir = true)
-      writeProotEntry(prootEntry)
+      if (skipRootfs) {
+        Log.i(TAG, "ubuntu rootfs extraction SKIPPED (legacy path): container probe blocked")
+      } else {
+        extractTarAsset("ubuntu-rootfs.tar.xz", File(homeDir, ".dsh/ubuntu-rootfs"), "xz", stripTopDir = true)
+        writeProotEntry(prootEntry)
+      }
       Log.i(TAG, "tool assets extracted (legacy, no manifest)")
       true
     } catch (t: Throwable) {
       Log.e(TAG, "tool asset extract failed (non-fatal)", t)
       false
+    }
+  }
+
+  /**
+   * 容器执行探针（2026-10-17 真机体检实锤后的降级闸门）。
+   *
+   * 事实基线：Android 16+ 与鸿蒙卓易通的内核拒绝 execve app 私有目录下的**非 bionic** ELF——
+   * 实测连 glibc 的 PIE（e_type=3）ld.so 拷贝都吃 errno 13，而同法拷贝的 bionic echo 正常执行。
+   * 也就是说闸门在**链接方式**不在 e_type，重编 PIE loader 救不了它（此前「PIE 是唯一用户态路子」
+   * 的判断已被对照实验证伪）。proot 与其 loader/guest ld.so 全在这一条下，rootfs 再完整也是摆设。
+   *
+   * 判据只用一次真实 execve 尝试 + 一个 bionic 对照，绝不做「文件在=能用」的假阳性推断：
+   *  - 无 ubuntu-rootfs 资产 → 无可决策项，直接放行且不碰探针文件；
+   *  - `/system/bin/su` 可执行 → proot-entry 走 root chroot，与内核闸无关 → 可用；
+   *  - 对照（/system/bin/echo）自己就 spawn 不起来 → 分不清闸的是 ELF 还是进程创建，探针不可信
+   *    → 判「不阻断」照常解压（**绝不让设备比修复前更糟**）；
+   *  - 对照通过、glibc 候选全数 EACCES/ENOEXEC → 判阻断 → 跳过 307MB 解压。
+   * 每次启动重探、不落粘性状态：设备一旦 root（su 出现）或内核策略变化，下一次启动立即恢复解压。
+   * 结论写进与插件（ubuntu_status/ubuntu_exec）同一份 schema 的探针文件，两侧共用判据。
+   */
+  private class ContainerProbe(val blocked: Boolean, val reason: String, val su: Boolean)
+
+  private fun suAvailable(): Boolean =
+    try {
+      arrayOf("/system/bin/su", "/system/xbin/su").any { File(it).canExecute() }
+    } catch (_: Throwable) {
+      false
+    }
+
+  /** execve 试探：null=内核放行该镜像；"refused"=被拒（EACCES/ENOEXEC）；"enoent"=文件不在；其余=不可判定。 */
+  private fun execAttempt(bin: File): String? {
+    if (!bin.isFile) return "enoent"
+    var p: Process? = null
+    return try {
+      val pb = ProcessBuilder(bin.absolutePath)
+      pb.redirectErrorStream(true)
+      pb.redirectOutput(ProcessBuilder.Redirect.to(File("/dev/null")))
+      p = pb.start()
+      null
+    } catch (t: Throwable) {
+      val msg = generateSequence(t) { it.cause }.joinToString(" ") { it.message ?: "" }
+      when {
+        msg.contains("error=13") || msg.contains("Permission denied") || msg.contains("error=8") ||
+          msg.contains("Exec format error") -> "refused"
+        msg.contains("error=2") || msg.contains("No such file") -> "enoent"
+        else -> "other"
+      }
+    } finally {
+      try {
+        p?.destroyForcibly()
+      } catch (_: Throwable) {
+      }
+    }
+  }
+
+  /** ELF 头第 17 字节（e_type）：2=ET_EXEC 非 PIE，3=ET_DYN/PIE；读不到返回 -1。 */
+  private fun elfEType(f: File): Int = try {
+    val buf = ByteArray(20)
+    java.io.FileInputStream(f).use { input ->
+      var off = 0
+      while (off < 20) {
+        val n = input.read(buf, off, 20 - off)
+        if (n < 0) break
+        off += n
+      }
+      if (off >= 18 && buf[0] == 0x7f.toByte() && buf[1] == 'E'.code.toByte() &&
+        buf[2] == 'L'.code.toByte() && buf[3] == 'F'.code.toByte()
+      ) {
+        (buf[16].toInt() and 0xFF) or ((buf[17].toInt() and 0xFF) shl 8)
+      } else -1
+    }
+  } catch (_: Throwable) {
+    -1
+  }
+
+  /** 探针候选：优先已进位的 operit-native 二进制；首启尚未落地时单拷 loader（1.6KB）到探针缓存。 */
+  private fun probeCandidates(m: AssetManifest?): List<File> {
+    val installed = listOf(File(operitNativeDir, "loader"), File(operitNativeDir, "proot")).filter { it.isFile }
+    if (installed.isNotEmpty()) return installed
+    val asset = "native/liboperit_loader.so"
+    if (!hasAsset(asset)) return emptyList()
+    val cache = File(context.filesDir, ".toolassets-probe/loader")
+    val expected = m?.assets?.get(asset)
+    val fresh = cache.isFile && (expected == null || sha256File(cache) == expected)
+    if (!fresh) {
+      cache.parentFile?.mkdirs()
+      copyAssetToFile(asset, cache)
+      cache.setExecutable(true, false)
+    }
+    return if (cache.isFile) listOf(cache) else emptyList()
+  }
+
+  private fun containerProbe(m: AssetManifest?): ContainerProbe {
+    if (!hasAsset("ubuntu-rootfs.tar.xz")) return ContainerProbe(false, "", suAvailable())
+    val su = suAvailable()
+    val candidates = probeCandidates(m)
+    if (su || candidates.isEmpty()) {
+      writeContainerProbe(false, if (su) "root-chroot" else "no-probe-target", su, candidates)
+      return ContainerProbe(false, "", su)
+    }
+    if (execAttempt(File("/system/bin/echo")) != null) {
+      // 对照组失败 = 探针本身不可信，保守放行：宁可为一个跑不起来的容器多解 307MB，
+      // 也不能凭一个失明的探针把 rootfs 判死（那会让已 root 的设备直接失去容器）。
+      Log.w(TAG, "container probe inconclusive: control /system/bin/echo cannot exec")
+      return ContainerProbe(false, "probe-control-failed", su)
+    }
+    val verdicts = candidates.map { execAttempt(it) }
+    val refusedAll = verdicts.all { it == "refused" }
+    if (refusedAll) {
+      val reason = "kernel-refused-exec"
+      Log.i(TAG, "container probe: execve refused for all " + candidates.size + " non-bionic candidates -> rootfs extraction skipped")
+      writeContainerProbe(true, reason, su, candidates)
+      return ContainerProbe(true, reason, su)
+    }
+    if (verdicts.any { it == null }) {
+      writeContainerProbe(false, "", su, candidates)
+      return ContainerProbe(false, "", su)
+    }
+    // 既非被拒也非放行（如 EPERM/other）：不可判定 → 不阻断，照常解压。
+    Log.w(TAG, "container probe inconclusive: " + verdicts.joinToString())
+    writeContainerProbe(false, "probe-inconclusive", su, candidates)
+    return ContainerProbe(false, "probe-inconclusive", su)
+  }
+
+  /** 探针结论落盘（原子替换），schema 与 dsh-android-dev-tools/src/index.js 的 writeProbe 对齐。 */
+  private fun writeContainerProbe(blocked: Boolean, reason: String, su: Boolean, candidates: List<File>) {
+    val f = File(homeDir, ".dsh/ubuntu-container-probe.json")
+    try {
+      f.parentFile?.mkdirs()
+      val o = org.json.JSONObject()
+      o.put("schema", 1)
+      o.put("at", java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US).apply {
+        timeZone = java.util.TimeZone.getTimeZone("UTC")
+      }.format(java.util.Date()))
+      o.put("blocked", blocked)
+      o.put("reason", reason)
+      o.put("su", su)
+      o.put("execMode", if (su) "root-chroot" else "proot")
+      o.put("loaderTypes", org.json.JSONArray(candidates.map { elfEType(it) }))
+      o.put("tail", "壳侧 execve 探针：" + candidates.joinToString { it.name + "->e_type" + elfEType(it) })
+      o.put("runner", "shell-probe")
+      val tmp = File(f.parentFile, f.name + ".tmp")
+      tmp.writeText(o.toString(2) + "\n")
+      java.nio.file.Files.move(tmp.toPath(), f.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    } catch (t: Throwable) {
+      Log.w(TAG, "container probe write failed (non-fatal)", t)
     }
   }
 
@@ -822,11 +982,21 @@ if [ "${'$'}{1:-}" = "-lc" ] || [ "${'$'}{1:-}" = "-c" ]; then CMD="${'$'}{2:-}"
 # ---- Root chroot 路径（su 可用时）----
 if [ -x /system/bin/su ]; then
   CMD_B64="${'$'}(printf '%s' "${'$'}CMD" | base64 | tr -d '\n')"
-  exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='${'$'}ROOTFS_DIR'; mount -t proc proc \"\${'$'}R/proc\" 2>/dev/null; mount -t sysfs sys \"\${'$'}R/sys\" 2>/dev/null; mount -o bind /dev \"\${'$'}R/dev\" 2>/dev/null; mount -t devpts devpts \"\${'$'}R/dev/pts\" 2>/dev/null; [ -s \"\${'$'}R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\${'$'}R/etc/resolv.conf\"; C=\$(printf '%s' '${'$'}CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\${'$'}R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 /bin/bash -lc \"\${'$'}C\""
+  exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='${'$'}ROOTFS_DIR'; mount -t proc proc \"\${'$'}R/proc\" 2>/dev/null; mount -t sysfs sys \"\${'$'}R/sys\" 2>/dev/null; mount -o bind /dev \"\${'$'}R/dev\" 2>/dev/null; mount -t devpts devpts \"\${'$'}R/dev/pts\" 2>/dev/null; mkdir -p \"\${'$'}R/tmp\" \"\${'$'}R/run\"; chmod 1777 \"\${'$'}R/tmp\" 2>/dev/null; [ -s \"\${'$'}R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\${'$'}R/etc/resolv.conf\"; C=\$(printf '%s' '${'$'}CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\${'$'}R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\${'$'}C\""
 fi
 # ---- proot fallback ----
-export PROOT_TMP_DIR="${'$'}{TMPDIR:-${'$'}HOME/tmp}"
-mkdir -p "${'$'}PROOT_TMP_DIR"
+# PROOT_TMP_DIR 要的是「能建出来且可写」的目录：TMPDIR 由壳侧 shellEnv() 注入（files/home/tmp），
+# 但该目录可能被清理器删掉；旧写法 mkdir -p 失败也照样把路径交给 proot，于是 proot 只吐一句
+# can't chmod '<...>/proot-XXXX': No such file or directory，把真实故障（执行被拒/目录缺失）盖掉。
+# 逐个候选确认存在+可写，取第一个成立的；全失败就直说临时目录问题，不再伪装成 proot 的错。
+for _cand in "${'$'}{TMPDIR:-}" "${'$'}HOME/.dsh/tmp" "${'$'}HOME/tmp"; do
+  [ -n "${'$'}_cand" ] || continue
+  if mkdir -p "${'$'}_cand" 2>/dev/null && [ -d "${'$'}_cand" ] && [ -w "${'$'}_cand" ]; then export PROOT_TMP_DIR="${'$'}_cand"; break; fi
+done
+if [ -z "${'$'}{PROOT_TMP_DIR:-}" ]; then
+  echo "proot-entry: 没有可用临时目录（TMPDIR=${'$'}{TMPDIR:-<空>} HOME=${'$'}HOME）——先修目录再谈容器" >&2
+  exit 1
+fi
 PROOT_BIN="${'$'}{PROOT_BIN:-$prootBin}"
 export PROOT_LOADER="${'$'}{PROOT_LOADER:-$loaderBin}"
 # 清理 termux-exec 的 execve 拦截（会把 guest 路径改写成宿主 PREFIX 路径，导致 proot execve 失败）。
@@ -1214,6 +1384,12 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       applyAssetPatch("patched/undo-savepoint-index.js", File(nm, "dsh-undo-savepoint/lib/index.js"))
       applyAssetPatch("patched/tool-installer-index.js",
         File(nm, "@dsh-android/dsh-android-tool-installer/lib/index.js"))
+      // 坑 84（2026-10-17 真机体检实锤）：已发布快照里的 dev-tools 只报「rootfs 在场」就当
+      // 「容器可用」（ubuntu_status ok:true），而同一台机器 ubuntu_exec 连 `true` 都跑不动
+      // ——内核对 app 私有目录下的非 bionic ELF 直接 EACCES。overlay 换成诚实判据：
+      // 在场/可用分开报、真实冒烟、失败可执行归因，并落壳侧共用的探针文件。
+      applyAssetPatch("patched/dev-tools-index.js",
+        File(nm, "@dsh-android/dsh-android-dev-tools/lib/index.js"))
       applyAssetPatch("patched/seagull-persona.md",
         File(nm, "@dsh-android/dsh-android-seagull/persona.md"))
       applyAssetPatch("patched/seagull-persona-core.md",

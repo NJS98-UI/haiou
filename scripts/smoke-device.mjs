@@ -116,8 +116,15 @@ async function main() {
   const toolOk = tools.ok && /apktool\.jar/.test(tools.stdout || '') && /jadx-1\.5\.0-all\.jar/.test(tools.stdout || '') && /apksigner\.jar/.test(tools.stdout || '');
   record('tools', toolOk, toolOk ? 'apktool/jadx/apksigner 就绪' : (tools.stdout || tools.error || tools.stderr));
 
-  const cont = await run('adb', suArgs(o, `ls ${FILES}/home/.dsh/ubuntu-rootfs/proot-entry.sh 2>&1`), 30000);
-  record('ubuntu', cont.ok && /proot-entry\.sh/.test(cont.stdout || ''), cont.stdout || cont.error || cont.stderr);
+  const contCmd = `ls ${FILES}/home/.dsh/ubuntu-rootfs/proot-entry.sh 2>&1; cat ${FILES}/home/.dsh/ubuntu-container-probe.json 2>/dev/null | tr -d '\n'`;
+  const cont = await run('adb', suArgs(o, contCmd), 30000);
+  const contOut = cont.stdout || cont.error || cont.stderr || '';
+  const haveEntry = /proot-entry\.sh/.test(contOut);
+  // 探针判死时壳侧刻意跳过 307MB rootfs 解压（内核拒绝非 bionic ELF 的平台限制，不是装配缺陷）：
+  // 冒烟据此报「按探针跳过」而不是 FAIL，否则这台机器上必然的降级会被读成构建坏了。
+  record('ubuntu', haveEntry || /"blocked"\s*:\s*true/.test(contOut),
+    haveEntry ? 'proot-entry 就绪'
+      : /"blocked"\s*:\s*true/.test(contOut) ? '容器探针判定 blocked，rootfs 按探针跳过解压（平台限制，非缺陷）' : contOut);
 
   console.log('\n' + JSON.stringify(results, null, 2));
   const failed = results.filter((r) => !r.ok);

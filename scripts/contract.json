@@ -25,6 +25,7 @@
   "assetOverlays": [
     { "asset": "app/src/main/assets/patched/ui-responsive-client.js", "built": "dsh-client-ui-responsive/lib/client.js" },
     { "asset": "app/src/main/assets/patched/tool-installer-index.js", "built": "plugins/dsh-android-tool-installer/lib/index.js" },
+    { "asset": "app/src/main/assets/patched/dev-tools-index.js", "built": "plugins/dsh-android-dev-tools/lib/index.js" },
     { "asset": "app/src/main/assets/patched/seagull-persona.md", "built": "plugins/dsh-android-seagull/persona.md" },
     { "asset": "app/src/main/assets/patched/seagull-persona-core.md", "built": "plugins/dsh-android-seagull/persona-core.md" },
     { "asset": "app/src/main/assets/patched/undo-savepoint-index.js", "built": "vendor/dsh-undo-savepoint/lib/index.js" }

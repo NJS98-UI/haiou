@@ -356,19 +356,99 @@ for (const n of needed) {
 }
 log(`下载就绪: ${ok}/${needed.size}`)
 
+/** deb822 控制段解析（保留多行字段的续行语义，Description 靠它才不丢第二行）。 */
+function parseDeb822(text) {
+  const out = new Map()
+  let k = null
+  let v = ''
+  for (const line of String(text).split('\n')) {
+    if (/^[ \t]*$/.test(line)) {
+      if (k !== null) { out.set(k, v); k = null }
+      continue
+    }
+    if (/^[ \t]/.test(line)) {
+      if (k !== null) v += '\n' + line.replace(/[ \t]+$/, '')
+      continue
+    }
+    const m = line.match(/^([A-Za-z0-9-]+):\s?(.*)$/)
+    if (k !== null) out.set(k, v)
+    if (m) { k = m[1]; v = m[2] } else { k = null }
+  }
+  if (k !== null) out.set(k, v)
+  return out
+}
+
+// dpkg status 段的字段次序（dpkg 自己写盘的次序，保持一致便于人读与 diff）。
+const STATUS_FIELD_ORDER = [
+  'Package', 'Status', 'Architecture', 'Multi-Arch', 'Essential', 'Priority', 'Section',
+  'Installed-Size', 'Maintainer', 'Original-Maintainer', 'Source', 'Version', 'Depends',
+  'Pre-Depends', 'Recommends', 'Suggests', 'Breaks', 'Conflicts', 'Provides', 'Replaces',
+  'Enhances', 'Homepage', 'Description', 'Tag',
+]
+
+/** status 段：优先原样搬运 .deb 控制字段（Depends/Installed-Size 等 apt 真会读），
+ *  仅在控制文件不可用时退回索引里的最小字段集（旧行为）。 */
+function dpkgStanza(n, p) {
+  const c = PKG_CONTROL.get(n)
+  if (c && c.get('Package')) {
+    const keys = []
+    for (const k of STATUS_FIELD_ORDER) if (c.has(k) && k !== 'Status') keys.push(k)
+    for (const k of c.keys()) if (!keys.includes(k)) keys.push(k)
+    const at = keys.indexOf('Package')
+    keys.splice(at + 1, 0, 'Status')
+    return keys
+      .map((k) => `${k}: ${k === 'Status' ? 'install ok installed' : c.get(k)}`)
+      .join('\n') + '\n'
+  }
+  return `Package: ${n}\nStatus: install ok installed\nArchitecture: ${p.arch || TERMUX_PKG}\nVersion: ${p.version}\nMaintainer: ${p.maintainer || 'Termux'}\nDescription: ${p.description || n}\n`
+}
+
 // ── 4. 提取 .deb → usr（.deb 为 ar 归档：WSL dpkg-deb --fsys-tarfile 输出 data.tar 流，
 //     直接 --strip-components=6（Termux deb 内部 data/data/com.termux/files/usr/…）──
 //     附加：postinst 的 alternatives 链接（Termux 常见入口为 postinst 经 update-alternatives
 //     创建，data 树不含这些 symlink——提取后按 --install 行创建等价链接，前缀改写）
+//     账实对账（P1-1 修复，2026-10-17 真机体检实锤）：同一条解流用 -v 打印成员清单落文件，
+//     换算成设备绝对路径后写进 dpkg 的 info/<pkg>.list。此前只写 status 不写 info/，
+//     117 个包「账上有、清单空」→ 任何 dpkg/apt 动作刷上百行 "does not contain any files"，
+//     dpkg -L 全废（详见 AGENTS.md 坑 85）。
 log('提取预装包…')
 let extracted = 0
+const PKG_LIST = new Map() // n → 设备绝对路径数组（目录带尾 /，dpkg .list 惯例）
+const PKG_CONTROL = new Map() // n → .deb 控制文件字段（status 补齐 Depends/Installed-Size 等）
+const DEB_FILES_ROOT = 'data/data/com.termux/files/' // deb 内部数据树根（usr 及其兄弟都在其下）
+const NEW_FILES_ROOT = dirname(NEW_PREFIX) // /data/user/0/<pkg>/files
+
+/** deb data.tar 成员名 → 设备绝对路径；树外成员返回 null（宁缺勿假）。
+ *  注：deb 内层祖先目录（./data/、./data/data/…）不落清单——dpkg 的 .list 只用于「包↔文件」对账，
+ *  合成一批多包共享的祖先反而会让 dpkg 误认为这些目录归本包所有。 */
+function debMemberToDevice(name) {
+  const isDir = name.endsWith('/')
+  const bare = isDir ? name.slice(0, -1) : name
+  const rel = bare.replace(/^\.\//, '')
+  if (rel === DEB_FILES_ROOT.slice(0, -1)) return NEW_FILES_ROOT + '/'
+  if (!rel.startsWith(DEB_FILES_ROOT)) return null
+  const dev = NEW_FILES_ROOT + '/' + rel.slice(DEB_FILES_ROOT.length)
+  return isDir ? dev + '/' : dev
+}
+
 const ALTLINK_RE = /--install\s+"([^"]+)"\s+\S+\s+"([^"]+)"/g
 for (const n of needed) {
   const file = join(DEBPOOL, n + '.deb')
   if (!existsSync(file)) continue
+  const listFile = join(DEBPOOL, 'x-list-' + n + '.txt')
   try {
     const u = wslPath(U)
-    wsl(`cd "${wslPath(dirname(file))}" && dpkg-deb --fsys-tarfile "${wslPath(file)}" | tar -xf - --strip-components=6 -C "${u}"`)
+    rmSync(listFile, { force: true })
+    // 清单走「落文件再读」而不是 sh() 的 stdout：wsl.exe 会往 stdout 混代理噪音（lib/shell.mjs 头部实锤）。
+    wsl(`cd "${wslPath(dirname(file))}" && dpkg-deb --fsys-tarfile "${wslPath(file)}" | tar -xvf - --strip-components=6 -C "${u}" > "${wslPath(listFile)}"`)
+    const devices = []
+    for (const line of readFileSync(listFile, 'utf8').split('\n')) {
+      const name = line.trim()
+      if (!name) continue
+      const dev = debMemberToDevice(name)
+      if (dev) devices.push(dev)
+    }
+    PKG_LIST.set(n, devices)
     extracted++
     // postinst alternatives（只读文本解析并创建 symlink，不执行脚本）
     // 布局语义：symlink 文件必须落在本地 stage（path 属于 usr 树），
@@ -378,6 +458,8 @@ for (const n of needed) {
       rmSync(ctl, { recursive: true, force: true })
       mkdirSync(ctl, { recursive: true })
       wsl(`dpkg-deb --ctrl-tarfile "${wslPath(file)}" | (cd "${wslPath(ctl)}" && tar -xf -)`)
+      const controlPath = join(ctl, 'control')
+      if (existsSync(controlPath)) PKG_CONTROL.set(n, parseDeb822(readFileSync(controlPath, 'utf8')))
       const postinst = join(ctl, 'postinst')
       if (existsSync(postinst)) {
         const txt = readFileSync(postinst, 'utf8')
@@ -391,17 +473,22 @@ for (const n of needed) {
             mkdirSync(dirname(linkLocal), { recursive: true })
             wsl(`ln -sfn "${target}" "${wslPath(linkLocal)}"`)
             console.log(`    [alt] ${relPath} -> ${target}`)
+            // alternatives 链接由本包创建，必须进账：否则 dpkg -L 少列、apt 重装时残留死链。
+            if (PKG_LIST.has(n)) PKG_LIST.get(n).push(linkDev)
           }
         }
       }
+      rmSync(ctl, { recursive: true, force: true })
     } catch {
       // postinst 处理失败不阻断（链接可能由其它包提供）
     }
   } catch (e) {
     console.warn(`  提取失败 ${n}: ${e.message.split('\n')[0]}`)
+  } finally {
+    rmSync(listFile, { force: true })
   }
 }
-log(`已提取: ${extracted}`)
+log(`已提取: ${extracted}（成员清单采集: ${PKG_LIST.size} 包）`)
 
 // ── 4b. usr/share/LICENSES 标准文本兜底（GPL 合规 A1，2026-08-23）──
 // copyleft 包的 usr/share/doc/<pkg>/copyright 是指向 ../../LICENSES/<fam>.txt 的软链。
@@ -424,20 +511,37 @@ try {
 }
 
 // ── 5. dpkg 数据库初始化（PRD F1.1：包清单非空、pkg/apt/dpkg 可用）──
+// 账实一致是本节唯一硬指标：status 里声明已安装的每个包，必须有同名 info/<pkg>.list 且非空。
+// 此前只写 status（info/ 空目录）→ dpkg/apt 每次动作刷上百行 "does not contain any files"、
+// dpkg -L 全废（P1-1）。md5sums 则**刻意不生成**：第 6/7 步会重写 shebang、清 RUNPATH、
+// 换 tar 包装脚本，落地后哈希必与 deb 内的原值不符，写一份注定错校的账比不写更坏。
 log('初始化 dpkg 数据库…')
-const dpkgStatus = []
-for (const n of [...needed].sort()) {
-  const p = pkgs.get(n)
-  if (!p.version) continue
-  dpkgStatus.push(`Package: ${n}\nVersion: ${p.version}\nArchitecture: ${p.arch || TERMUX_PKG}\nMaintainer: ${p.maintainer || 'Termux'}\nDescription: ${p.description || ''}\nStatus: install ok installed\n`)
-}
 const dpkgDir = join(U, 'var/lib/dpkg')
 mkdirSync(join(dpkgDir, 'info'), { recursive: true })
 mkdirSync(join(dpkgDir, 'parts'), { recursive: true })
+const dpkgStatus = []
+const listWritten = []
+const noFiles = []
+for (const n of [...needed].sort()) {
+  const p = pkgs.get(n)
+  if (!p.version) continue
+  const files = PKG_LIST.get(n)
+  if (!files || files.length === 0) {
+    // 无落点可账 = 包实际没进快照（下载/提取失败）：不再往 status 里登记 installed，
+    // 否则又造出一个「账上有、实无文件」的幽灵包，本节的修复就白做。
+    noFiles.push(n)
+    continue
+  }
+  dpkgStatus.push(dpkgStanza(n, p))
+  listWritten.push(n)
+  writeFileSync(join(dpkgDir, 'info', n + '.list'), files.join('\n') + '\n')
+}
 writeFileSync(join(dpkgDir, 'status'), dpkgStatus.join('\n'))
 writeFileSync(join(dpkgDir, 'status-old'), dpkgStatus.join('\n'))
 writeFileSync(join(dpkgDir, 'available'), indexText.split('\n\n').filter((b) => b.startsWith('Package:')).join('\n\n') + '\n')
-log('dpkg status: ' + dpkgStatus.length + ' 包')
+log('dpkg status: ' + dpkgStatus.length + ' 包，info/*.list: ' + listWritten.length + ' 份')
+if (noFiles.length) console.warn(`  [账实告警] 无落点、已从 installed 账上剔除: ${noFiles.join(' ')}`)
+if (listWritten.length !== dpkgStatus.length) throw new Error('dpkg 账实不一致：status 与 info/*.list 数量不等的路径不应存在')
 
 // ── 6. shebang 与 ELF RUNPATH 重写（com.termux → com.dsharnessmobile.shell）──
 log('重写 shebang/RUNPATH…')

@@ -10,6 +10,11 @@ PROOT_BIN="${PREFIX}/share/operit-native/proot"
 
 if [ ! -d "${UBUNTU_ROOT}" ]; then
     echo "[Seagull Error] Ubuntu rootfs not found at ${UBUNTU_ROOT}"
+    # 壳侧容器探针判死时会主动跳过 307MB rootfs 解压（非缺陷、非中断），这里把原因摊开，
+    # 免得运维把它读成「解压坏了」。探针文件与插件 ubuntu_status/ubuntu_exec 共用同一 schema。
+    if [ -f "${HOME_DIR}/.dsh/ubuntu-container-probe.json" ]; then
+        echo "[Seagull Info] 容器探针结论: $(head -c 400 "${HOME_DIR}/.dsh/ubuntu-container-probe.json")"
+    fi
     exit 1
 fi
 
@@ -23,15 +28,24 @@ fi
 # ---- Root chroot 路径（KernelSU/Magisk su 可用时）----
 if [ -x /system/bin/su ]; then
     CMD_B64="$(printf '%s' "$CMD" | base64 | tr -d '\n')"
-    exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='$UBUNTU_ROOT'; mount -t proc proc \"\$R/proc\" 2>/dev/null; mount -t sysfs sys \"\$R/sys\" 2>/dev/null; mount -o bind /dev \"\$R/dev\" 2>/dev/null; mount -t devpts devpts \"\$R/dev/pts\" 2>/dev/null; [ -s \"\$R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\$R/etc/resolv.conf\"; C=\$(printf '%s' '$CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\$R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 /bin/bash -lc \"\$C\""
+    exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='$UBUNTU_ROOT'; mount -t proc proc \"\$R/proc\" 2>/dev/null; mount -t sysfs sys \"\$R/sys\" 2>/dev/null; mount -o bind /dev \"\$R/dev\" 2>/dev/null; mount -t devpts devpts \"\$R/dev/pts\" 2>/dev/null; mkdir -p \"\$R/tmp\" \"\$R/run\"; chmod 1777 \"\$R/tmp\" 2>/dev/null; [ -s \"\$R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\$R/etc/resolv.conf\"; C=\$(printf '%s' '$CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\$R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\$C\""
 fi
 
 # ---- proot fallback ----
 # 初始化虚假 sysdata（Android 内核 /proc/stat 缺桌面字段，容器内 nproc/ps/CMake 会读 0 核）
 "${HOME_DIR}/.dsh/scripts/setup_fake_sysdata.sh" "${UBUNTU_ROOT}" 2>/dev/null || true
-# proot 默认用编译期 Termux tmp（/data/data/com.termux/...）建 glue rootfs，app 域不存在 → 必须显式指定
-export PROOT_TMP_DIR="${TMPDIR:-$HOME_DIR/tmp}"
-mkdir -p "$PROOT_TMP_DIR"
+# PROOT_TMP_DIR 要的是「能建出来且可写」的目录：TMPDIR 由壳侧 shellEnv() 注入（files/home/tmp），
+# 但该目录可能被清理器删掉；旧写法 mkdir -p 失败也照样把路径交给 proot，于是 proot 只吐一句
+# can't chmod '<...>/proot-XXXX': No such file or directory，把真实故障（执行被拒/目录缺失）盖掉。
+# 逐个候选确认存在+可写，取第一个成立的；全失败就直说临时目录问题，不再伪装成 proot 的错。
+for _cand in "${TMPDIR:-}" "$HOME_DIR/.dsh/tmp" "$HOME_DIR/tmp"; do
+    [ -n "$_cand" ] || continue
+    if mkdir -p "$_cand" 2>/dev/null && [ -d "$_cand" ] && [ -w "$_cand" ]; then export PROOT_TMP_DIR="$_cand"; break; fi
+done
+if [ -z "${PROOT_TMP_DIR:-}" ]; then
+    echo "launch_ubuntu_proot: 没有可用临时目录（TMPDIR=${TMPDIR:-<空>} HOME=$HOME_DIR）——先修目录再谈容器" >&2
+    exit 1
+fi
 # 自包含 Operit proot：loader 与 proot 同目录（usr/share/operit-native），用 PROOT_LOADER 显式指定
 export PROOT_LOADER="${PROOT_LOADER:-${PREFIX}/share/operit-native/loader}"
 # 清理 termux-exec 的 execve 拦截（会把 guest 路径改写成宿主 PREFIX 路径，导致 proot execve 失败）

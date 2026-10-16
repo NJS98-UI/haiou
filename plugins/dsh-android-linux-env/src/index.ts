@@ -48,11 +48,38 @@ function toolchainStatus(adbTier?: string): Record<string, unknown> {
   for (const t of tools) present[t] = existsSync(join(prefix, 'bin', t))
   const dpkg = join(prefix, 'var', 'lib', 'dpkg', 'status')
   const pkgCount = existsSync(dpkg) ? (readFileSync(dpkg, 'utf8').match(/^Package: /gm)?.length ?? 0) : 0
+  // 账实对账（2026-10-17 真机体检实锤，坑 85）：status 只登记包名、info/*.list 才是文件清单。
+  // 旧快照构建器只写 status（info/ 空）→ 117 包「账上有、实无文件」，任何 dpkg/apt 动作刷上百行
+  // "does not contain any files"，dpkg -L 全废。把两个数分开报出来，体检才分得清「没装」与「账本坏了」。
+  let dpkgLists = 0
+  try {
+    dpkgLists = readdirSync(join(prefix, 'var', 'lib', 'dpkg', 'info')).filter((f) => f.endsWith('.list')).length
+  } catch { /* info/ 不存在 = 账本未初始化，保持 0 */ }
+  // 容器可用性：判据与 dsh-android-dev-tools 共用同一份探针文件（在场≠可用，勿在此重算）。
+  const probePath = join(envFacts().home, '.dsh', 'ubuntu-container-probe.json')
+  let container: Record<string, unknown> = { probed: false }
+  try {
+    if (existsSync(probePath)) {
+      const p = JSON.parse(readFileSync(probePath, 'utf8')) as Record<string, unknown>
+      container = {
+        probed: true,
+        usable: p.blocked !== true,
+        blocked: p.blocked === true,
+        reason: p.reason ?? '',
+        execMode: p.execMode ?? (p.su ? 'root-chroot' : 'proot'),
+        probedAt: p.at ?? '',
+        by: p.runner ?? '',
+      }
+    }
+  } catch { /* 探针文件损坏按未探测报，不让体检整体崩 */ }
   return {
     prefix,
     tools: present,
     dpkgPackages: pkgCount,
     dpkgInitialized: pkgCount > 0,
+    dpkgLists,
+    dpkgLedgerConsistent: pkgCount > 0 && pkgCount === dpkgLists,
+    container,
     // 与 dsh-android-bridge 同一判定权威（审校 C6：此前 linux-env 读 env 恒 T0，
     // 与 bridge 不同源造成显示不一致——现经 androidPrivilege.status() 同源）。
     adbTier: adbTier ?? envFacts().adbTier,
@@ -95,7 +122,7 @@ function recipeExport(): Record<string, unknown> {
 function tools(svc: { status(): { tier: string } } | undefined) {
   const statusTool = defineTool({
     name: 'android_toolchain_status',
-    description: '工具链状态：预装清单存在性、dpkg 数据库初始化状态、ADB 授权档位。用于诊断「某工具为什么不可用」。',
+    description: '工具链状态：预装清单存在性、dpkg 数据库账实对账（status 包数 vs info/*.list 份数）、Ubuntu 容器可用性探针、ADB 授权档位。用于诊断「某工具为什么不可用」。',
     parameters: {},
     output: {
       schema: {
@@ -106,11 +133,20 @@ function tools(svc: { status(): { tier: string } } | undefined) {
           tools: { type: 'object', additionalProperties: true },
           dpkgPackages: { type: 'number' },
           dpkgInitialized: { type: 'boolean' },
+          dpkgLists: { type: 'number' },
+          dpkgLedgerConsistent: { type: 'boolean' },
+          container: { type: 'object', additionalProperties: true },
           adbTier: { type: 'string' },
         },
       },
       render: (_args, v: Record<string, unknown>) => [
-        { type: 'text', text: `工具链 ${String(v.prefix)}：dpkg ${String(v.dpkgPackages)} 包 / ADB ${String(v.adbTier)}\n` + JSON.stringify(v.tools ?? {}) },
+        {
+          type: 'text',
+          text: `工具链 ${String(v.prefix)}：dpkg 账 ${String(v.dpkgPackages)} 包 / 实 ${String(v.dpkgLists)} 份清单` +
+            `（${v.dpkgLedgerConsistent ? '一致' : '不一致——快照构建器侧缺陷，见坑 85'}）` +
+            ` / 容器 ${String((v.container as Record<string, unknown> | undefined)?.usable ?? '未探测')}` +
+            ` / ADB ${String(v.adbTier)}\n` + JSON.stringify(v.tools ?? {}),
+        },
       ],
     },
     execute: async () => toolchainStatus(svc?.status().tier) as never,
