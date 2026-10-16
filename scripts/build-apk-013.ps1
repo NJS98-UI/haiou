@@ -122,6 +122,11 @@ foreach ($abi in @('arm64')) {
 
     # 2. 门禁（关键工具存在性 + ELF 架构 + 机密 + GPL 合规）
     Write-Host "== 门禁（$abi）=="
+    # 坑 77：build-snapshot 的 TARGETS 加包必须同批登记 scripts/third-party-licenses.json。
+    # 下面 check-third-party 那道权威闸要读归档内 dpkg status（Windows 侧还经 wsl.exe，本机无
+    # 发行版则跑不动），所以「加 jq」只在云端 build-apk 才红；这道纯静态对账把同一条不变量提前。
+    node (Join-Path $Root "scripts\check-targets-licenses.mjs") 2>&1 | Select-Object -First 4
+    if ($LASTEXITCODE -ne 0) { Write-Host "TARGETS-LICENSES 对账失败，拒绝打包（$abi）"; $failed += "[$abi] TARGETS 许可登记缺失"; continue }
     # 第三方许可合规（GPL 义务 A1/A2 门禁 2026-08-23）：copyleft 包许可证全文须随快照分发，
     # 矩阵须覆盖 dpkg status 全部包；缺失直接拒绝打包（--- tar 视图：9p 权限不影响判定）。
     node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn 2>&1 | Select-Object -First 4

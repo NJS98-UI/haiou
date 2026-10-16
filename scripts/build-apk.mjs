@@ -93,6 +93,9 @@ try {
   // ---- 2. 门禁（全部跨平台脚本）----
   log('门禁：patch 挂载集校验…')
   run('node', [join(ROOT, 'scripts', 'check-patch-mounts.mjs'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), ...pluginDirs, undo, market])
+  log('门禁：快照装配清单与许可矩阵对账（坑 77）…')
+  // TARGETS 加包必同批登记 scripts/third-party-licenses.json；纯静态零依赖，本地/CI 同口径
+  run('node', [join(ROOT, 'scripts', 'check-targets-licenses.mjs')])
   log('门禁：第三方许可…')
   run('node', [join(ROOT, 'scripts', 'check-third-party.mjs'), 'x', '--tar', snapIn])
   log('门禁：机密…')

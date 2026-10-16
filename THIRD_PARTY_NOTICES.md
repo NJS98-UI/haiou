@@ -26,6 +26,7 @@
 | git | 2.55.0 | GPL-2.0 | [termux-packages/git](https://github.com/termux/termux-packages/tree/master/packages/git) |
 | grep | 3.12-3 | GPL-3.0+ | [termux-packages/grep](https://github.com/termux/termux-packages/tree/master/packages/grep) |
 | gzip | 1.14-1 | GPL-3.0+ | [termux-packages/gzip](https://github.com/termux/termux-packages/tree/master/packages/gzip) |
+| jq | 1.8.2 | MIT | [termux-packages/jq](https://github.com/termux/termux-packages/tree/master/packages/jq) |
 | less | 704 | GPL-3.0+ | [termux-packages/less](https://github.com/termux/termux-packages/tree/master/packages/less) |
 | libacl | 2.4.0 | LGPL-2.1+ | [termux-packages/libacl](https://github.com/termux/termux-packages/tree/master/packages/libacl) |
 | libandroid-execinfo | 0.1-3 | MIT | [termux-packages/libandroid-execinfo](https://github.com/termux/termux-packages/tree/master/packages/libandroid-execinfo) |
@@ -59,6 +60,7 @@
 | libyaml | 0.2.5-5 | MIT | [termux-packages/libyaml](https://github.com/termux/termux-packages/tree/master/packages/libyaml) |
 | ncurses | 6.6.20260307+really6.5.20250830 | MIT | [termux-packages/ncurses](https://github.com/termux/termux-packages/tree/master/packages/ncurses) |
 | ncurses-ui-libs | 6.6.20260307+really6.5.20250830 | MIT | [termux-packages/ncurses-ui-libs](https://github.com/termux/termux-packages/tree/master/packages/ncurses-ui-libs) |
+| oniguruma | 6.9.10-1 | BSD-2-Clause | [termux-packages/oniguruma](https://github.com/termux/termux-packages/tree/master/packages/oniguruma) |
 | openssl | 1:3.6.3 | Apache-2.0 | [termux-packages/openssl](https://github.com/termux/termux-packages/tree/master/packages/openssl) |
 | openssl-tool | 1:3.6.3 | Apache-2.0 | [termux-packages/openssl-tool](https://github.com/termux/termux-packages/tree/master/packages/openssl-tool) |
 | pcre2 | 10.47 | BSD-3-Clause | [termux-packages/pcre2](https://github.com/termux/termux-packages/tree/master/packages/pcre2) |

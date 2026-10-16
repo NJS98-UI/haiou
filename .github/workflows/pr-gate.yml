@@ -47,6 +47,12 @@ jobs:
       - name: spill-local Android 祖先补丁在场（坑 76 回归）
         run: |
           node scripts/patch-spill-local-android.mjs app/src/main/assets/patched/spill-local-index.js --check
+      # 坑 77：build-snapshot-013.mjs 的 TARGETS 加包必须同批登记 scripts/third-party-licenses.json。
+      # 权威闸 check-third-party.mjs 要读归档里的 dpkg status（Windows 侧还经 wsl.exe），本地跑不动，
+      # 结果「加 jq → 云端 build-apk 三连红」。这道纯静态对账把同一不变量提到 PR 红绿灯上。
+      - name: 快照装配清单与许可矩阵对账（坑 77 回归）
+        run: |
+          node scripts/check-targets-licenses.mjs
       # 插件版本钉门禁（2026-10 第三轮复盘接线）：此前 check-contract.mjs 只存在于手动执行与
       # 文档记载——某插件私自升降 dsh-tools/cordis/schemastery 版本 → 装配期 ERESOLVE/类型崩
       # （坑 41/42 家族复发）且 CI 零拦截。注意其 inserted 仅覆盖 shell-termux/ui-responsive 两项，
