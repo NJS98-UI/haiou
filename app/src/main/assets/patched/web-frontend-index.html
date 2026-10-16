@@ -31,8 +31,188 @@
           if (n < 0 || n >= this.length) return undefined;
           return this.charAt(n);
         });
-        // #81 补充观察：老内核同样缺 structuredClone/Array.flat 的场景由 dsh 上游兜底，这里不加
-        // 未报告项（最小面）。若 #81 评论区补报再扩。
+      })();
+      // dsh-mobile-es2023-polyfill（2026-10-16，同一病灶的第二档）：0.1.7-rc.2 引擎线交给浏览器
+      // 执行的插件包（npm registry 取 0.1.7-rc.2 的 66 个 lib/client.js 全量扫描）把内置 API
+      // 门槛抬到了 Chrome 97/98/99/110/**119**，而 0.1.5-rc.2（可用对照线）最高只需 Chrome 98。
+      // 决定性的那一项是 Promise.withResolvers（Chrome 119）——调用它的是 dsh-api-gateway
+      // （RPC 载体）与 dsh-api-session-controller（会话/消息/工作区文件）：内核缺它时这两个包
+      // 在模块初始化即抛 TypeError，于是**静态壳照常渲染、引擎 HTTP 照常 200，而工作区面板
+      // （含「临时工作区」）与消息应答全灭**——正是「同一个 APK 测试机好用、我自己的（华为系
+      // 定制内核）机器没有临时工作区、发消息没回复」，也是 deep/0.1.5 能在同一台机器上正常
+      // 工作的原因（它不需要 119 的 API）。壳侧对此完全不自知：探活走的是引擎侧 HTTP，
+      // 崩溃发生在浏览器 realm 里。
+      // 逐项按实扫命中补齐，只在缺失时定义（有原生就用原生）；整段保持 ES5 语法——这段脚本
+      // 先于任何业务 script 执行，它自己必须先能在老内核里解析。
+      (function () {
+        var g = (typeof globalThis !== "undefined") ? globalThis : window;
+        function def(t, k, v) {
+          if (k in t) return;
+          try { Object.defineProperty(t, k, { value: v, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+        }
+        function toLen(o) { var n = Number(o.length); if (!isFinite(n) || n !== n) return 0; return Math.min(Math.max(Math.trunc(n), 0), 9007199254740991); }
+        // Array.prototype.findLast / findLastIndex（Chrome 97：chat / conversation / trajectory）
+        // 规范按 Get 取值（空洞读成 undefined，不跳过），这里同口径。
+        function makeFindLast(wantIndex) {
+          return function (fn, thisArg) {
+            if (typeof fn !== "function") throw new TypeError(wantIndex ? "findLastIndex requires a callable" : "findLast requires a callable");
+            var o = Object(this), len = toLen(o);
+            for (var i = len - 1; i >= 0; i--) {
+              var v = o[i];
+              if (fn.call(thisArg, v, i, o)) return wantIndex ? i : v;
+            }
+            return wantIndex ? -1 : void 0;
+          };
+        }
+        def(Array.prototype, "findLast", makeFindLast(false));
+        def(Array.prototype, "findLastIndex", makeFindLast(true));
+        // Array.prototype.toReversed / toSorted / toSpliced（Chrome 110：model-selection /
+        // schedule / settings-models）——非变异副本；参数规范化直接交给同引擎的 splice/sort，
+        // 与原生实现同一条内部路径。
+        function copySelf() {
+          var o = Object(this), len = toLen(o), a = new Array(len);
+          for (var i = 0; i < len; i++) a[i] = o[i];
+          return a;
+        }
+        def(Array.prototype, "toReversed", function () { return copySelf.call(this).reverse(); });
+        def(Array.prototype, "toSorted", function (cmp) {
+          if (cmp !== void 0 && typeof cmp !== "function") throw new TypeError("toSorted comparator must be a function");
+          return copySelf.call(this).sort(cmp);
+        });
+        def(Array.prototype, "toSpliced", function (start, deleteCount) {
+          var a = copySelf.call(this);
+          if (arguments.length === 0) return a;
+          if (arguments.length === 1) { a.splice(start); return a; }
+          a.splice.apply(a, Array.prototype.slice.call(arguments));
+          return a;
+        });
+        // Promise.withResolvers（Chrome 119：dsh-api-gateway / dsh-api-session-controller /
+        // dsh-api-terminal-controller / dsh-api-workspace-files / ui-approval /
+        // ui-agent-preset / ui-user-questions）——本条缺失即整条 RPC 通道不起。
+        def(Promise, "withResolvers", function () {
+          var box = {};
+          var promise = new Promise(function (resolve, reject) { box.resolve = resolve; box.reject = reject; });
+          return { promise: promise, resolve: box.resolve, reject: box.reject };
+        });
+        // structuredClone（Chrome 98：dsh-client-ui-settings / settings-models）
+        // 覆盖 dsh 浏览器侧真实出现的值形态：原始值、数组、普通对象、Date/RegExp、
+        // Map/Set、ArrayBuffer 与 TypedArray/DataView，并处理循环引用。
+        // 刻意的偏离：函数/Symbol 原生抛 DataCloneError，这里按「丢弃该属性」处理——
+        // 崩溃一个可运行的界面与静默丢一个不可序列化的字段之间选择后者；dsh 的调用点
+        // （设置项 ops 副本）不含这类值。
+        def(g, "structuredClone", function (value) {
+          var ks = [], vs = [];
+          function memo(k, v) { ks.push(k); vs.push(v); return v; }
+          function prior(k) { var i = ks.indexOf(k); return i < 0 ? void 0 : vs[i]; }
+          function clone(v) {
+            if (v === null) return null;
+            var t = typeof v;
+            if (t !== "object") return (t === "function" || t === "symbol") ? void 0 : v;
+            if (v instanceof Date) return new Date(v.getTime());
+            if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+            if (typeof ArrayBuffer !== "undefined") {
+              if (v instanceof ArrayBuffer) return v.slice(0);
+              if (typeof DataView !== "undefined" && v instanceof DataView) {
+                return new DataView(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+              }
+              if (ArrayBuffer.isView(v)) {
+                var Ctor = v.constructor;
+                return new Ctor(Array.prototype.slice.call(v));
+              }
+            }
+            var done = prior(v);
+            if (done) return done;
+            if (Array.isArray(v)) {
+              var arr = memo(v, new Array(v.length));
+              for (var i = 0; i < v.length; i++) arr[i] = clone(v[i]);
+              return arr;
+            }
+            if (typeof Map === "function" && v instanceof Map) {
+              var m = memo(v, new Map());
+              v.forEach(function (mv, mk) { m.set(clone(mk), clone(mv)); });
+              return m;
+            }
+            if (typeof Set === "function" && v instanceof Set) {
+              var s = memo(v, new Set());
+              v.forEach(function (sv) { s.add(clone(sv)); });
+              return s;
+            }
+            var out = memo(v, {});
+            var keys = Object.keys(v);
+            for (var j = 0; j < keys.length; j++) {
+              var cv = clone(v[keys[j]]);
+              if (cv === void 0 && typeof v[keys[j]] === "function") continue;
+              out[keys[j]] = cv;
+            }
+            return out;
+          }
+          return clone(value);
+        });
+        // Intl.Segmenter（Chrome 99：dsh-client-ui-chat 的光标/选区按字素簇计位）
+        // 近似实现：按码点成簇，并入组合符（U+0300–036E / U+1AB0–1AFF / U+1DC0–1DFF /
+        // U+20D0–20F0 / U+FE00–FE0F / U+FE20–FE2F / U+0F8F）、零宽连接符（ZWJ 序列整体一簇）、
+        // 表情修饰符（U+1F3FB–1F3FF）、CRLF、区域指示符两两成对（国旗）。
+        // 不追求完整 UAX#29（不做脚本延展与 Indic 连字簇），但保证「各段首尾相接 === 原串、
+        // index 连续」——这正是光标位移与选区计算需要的不变量。
+        // word/sentence 粒度按字素返回（调用侧只用于高亮范围，降级不致错乱）。
+        try {
+          if (typeof Intl !== "undefined" && !Intl.Segmenter) {
+            function isCombining(cp) {
+              return (cp >= 0x0300 && cp <= 0x036E) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+                     (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20F0) ||
+                     (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xFE20 && cp <= 0xFE2F) ||
+                     cp === 0x0F8F || cp === 0x200C;
+            }
+            function isRegional(cp) { return cp >= 0x1F1E6 && cp <= 0x1F1FF; }
+            // Extender：本身并入前簇的码点（ZWJ 也要并，否则「👨‍👩」会裂成一堆单码点）
+            function isExtender(cp) {
+              return isCombining(cp) || cp === 0x200D || (cp >= 0x1F3FB && cp <= 0x1F3FF);
+            }
+            function codePoints(s) {
+              var out = [], i = 0;
+              while (i < s.length) {
+                var hi = s.charCodeAt(i), cp = hi, end = i + 1;
+                if (hi >= 0xD800 && hi <= 0xDBFF && i + 1 < s.length) {
+                  var lo = s.charCodeAt(i + 1);
+                  if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = (hi - 0xD800) * 0x400 + (lo - 0xDC00) + 0x10000; end = i + 2; }
+                }
+                out.push({ cp: cp, start: i, end: end });
+                i = end;
+              }
+              return out;
+            }
+            function cluster(s) {
+              var cps = codePoints(s), out = [], j = 0;
+              while (j < cps.length) {
+                var k = j + 1, ri = isRegional(cps[j].cp) ? 1 : 0;
+                while (k < cps.length) {
+                  var cp = cps[k].cp, prev = cps[k - 1].cp;
+                  var glue = (cp === 0x0A && prev === 0x0D) || isExtender(cp) || prev === 0x200D ||
+                             (isRegional(cp) && ri % 2 === 1);
+                  if (!glue) break;
+                  if (isRegional(cp)) ri++;
+                  k++;
+                }
+                out.push({ segment: s.slice(cps[j].start, cps[k - 1].end), index: cps[j].start, input: s });
+                j = k;
+              }
+              return out;
+            }
+            function iterable(arr) {
+              if (typeof Symbol !== "undefined" && Symbol.iterator) {
+                arr[Symbol.iterator] = function () {
+                  var i = 0;
+                  return { next: function () { return i < arr.length ? { value: arr[i++], done: false } : { value: void 0, done: true }; } };
+                };
+              }
+              return arr;
+            }
+            var Seg = function (locale, options) { this._granularity = (options && options.granularity) || "grapheme"; };
+            Seg.prototype.resolvedOptions = function () { return { locale: "und", granularity: this._granularity }; };
+            Seg.prototype.segment = function (input) { return iterable(cluster(String(input === null ? "null" : input === void 0 ? "undefined" : input))); };
+            Intl.Segmenter = Seg;
+          }
+        } catch (e) {}
       })();
       // dsh-mobile-clip-fallback-web: Android WebView rejects
       // navigator.clipboard.writeText with NotAllowedError (no permission
