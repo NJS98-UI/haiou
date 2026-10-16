@@ -96,10 +96,15 @@ cat << 'EOF' > "${ROOTFS_SRC}/proot-entry.sh"
 ROOTFS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 提取命令：兼容 `-lc CMD`（ubuntu_exec 默认）与直接 `CMD...`。
 if [ "${1:-}" = "-lc" ] || [ "${1:-}" = "-c" ]; then CMD="${2:-}"; else CMD="$*"; fi
-# ---- Root chroot 路径（su 可用时）----
-if [ -x /system/bin/su ]; then
+# ---- Root chroot 路径（su 可用时；候选见 EngineManager.SU_CANDIDATES，Magisk/KernelSU 常在 /system/bin 之外）----
+SU=""
+for _su in /system/bin/su /system/xbin/su /sbin/su /product/bin/su /product/xbin/su /vendor/bin/su /apex/com.android.runtime/bin/su /system_ext/bin/su; do
+  [ -x "$_su" ] && SU="$_su" && break
+done
+[ -n "$SU" ] || SU="$(command -v su 2>/dev/null || true)"
+if [ -n "$SU" ]; then
   CMD_B64="$(printf '%s' "$CMD" | base64 | tr -d '\n')"
-  exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='$ROOTFS_DIR'; mount -t proc proc \"\$R/proc\" 2>/dev/null; mount -t sysfs sys \"\$R/sys\" 2>/dev/null; mount -o bind /dev \"\$R/dev\" 2>/dev/null; mount -t devpts devpts \"\$R/dev/pts\" 2>/dev/null; mkdir -p \"\$R/tmp\" \"\$R/run\"; chmod 1777 \"\$R/tmp\" 2>/dev/null; [ -s \"\$R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\$R/etc/resolv.conf\"; C=\$(printf '%s' '$CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\$R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\$C\""
+  exec "$SU" -c "export PATH=/system/bin:/system/xbin:/product/bin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='$ROOTFS_DIR'; mount -t proc proc \"\$R/proc\" 2>/dev/null; mount -t sysfs sys \"\$R/sys\" 2>/dev/null; mount -o bind /dev \"\$R/dev\" 2>/dev/null; mount -t devpts devpts \"\$R/dev/pts\" 2>/dev/null; mkdir -p \"\$R/tmp\" \"\$R/run\"; chmod 1777 \"\$R/tmp\" 2>/dev/null; [ -s \"\$R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\$R/etc/resolv.conf\"; C=\$(printf '%s' '$CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\$R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\$C\""
 fi
 # ---- proot fallback ----
 # PROOT_TMP_DIR 要的是「能建出来且可写」的目录：TMPDIR 由壳侧 shellEnv() 注入（files/home/tmp），

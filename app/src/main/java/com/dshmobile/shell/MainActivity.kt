@@ -1354,6 +1354,30 @@ class MainActivity : ComponentActivity() {
     sb.append("  settings.yaml: present=").append(File(dsh, "settings.yaml").isFile)
       .append(" imported=").append(File(dsh, "settings.yaml.imported").isFile)
       .append("（imported 在场 = 出厂模板已被一次性导入消费过；此时归档模板不得重新落盘，坑 80）\n")
+    // 坑 87：用户在设置界面写的自定义供应商/默认模型住在 profiles/*/cordis*.yml 尾部，而那份文件
+    // 随快照换代整片重抽。只报「有没有 providers 段/尺寸/基线在场」，绝不外泄任何 URL 或键名以外的内容。
+    for (profile in listOf("web", "headless")) {
+      val patch = File(File(dsh, "profiles/$profile"), "cordis.patch.yml")
+      val baseline = File(File(dsh, ".profile-factory-baseline/$profile"), "cordis.patch.yml")
+      var hasProviders = false
+      var ids = 0
+      try {
+        if (patch.isFile) {
+          patch.forEachLine { l ->
+            if (l.trimStart() == "providers:") hasProviders = true
+            if (l.startsWith("- id:")) ids++
+          }
+        }
+      } catch (_: Throwable) {
+      }
+      sb.append("  profile ").append(profile).append(": cordis.patch.yml=")
+        .append(if (patch.isFile) "present(" + patch.length() + "B," + ids + " 项)" else "absent")
+        .append(" 用户providers段=").append(hasProviders)
+        .append(" 工厂基线=").append(if (baseline.isFile) "present" else "absent")
+        .append(if (!hasProviders && File(dsh, ".credentials.yaml").isFile && baseline.isFile)
+          "  <= 坑 87：基线在场而 providers 段缺席 = 重抽把用户供应商冲掉了，会话模型串会悬空（NO_ADAPTER）" else "")
+        .append('\n')
+    }
     val heal = File(dsh, ".storage-heal.json")
     val repair = File(filesDir, ".engine-repair.json")
     sb.append("  storage-heal mirror: ").append(if (heal.isFile) heal.readText().take(200) else "absent").append('\n')

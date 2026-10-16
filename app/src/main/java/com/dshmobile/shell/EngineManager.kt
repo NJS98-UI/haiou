@@ -148,6 +148,8 @@ class EngineManager(private val context: Context, private val pickToken: String?
         // 为一个读不动的用户文件把整轮重抽卡死，等于让「读盘偶发失败」升级成「这台机器再也修不好」。
         if (!backupOk) LogCollector.log(TAG, "user data backup incomplete; continuing (restore merges per file, live data is never deleted)")
       }
+      // 坑 87：重抽**前**把现场 profile 配置与上一轮工厂基线读进内存（重抽会原地覆盖它们）。
+      val profileHeld = ProfileConfigMerge.capture(dsh)
       val ok = extractSnapshot(onProgress)
       if (!ok) {
         if (restoreUserData(backup, dsh)) backup.deleteRecursively()
@@ -165,6 +167,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
         noteStartDecision("refresh INCOMPLETE: missing " + missing.joinToString(",") { it.name } + " (fingerprint not written)")
         return false
       }
+      // 坑 87：重抽把 profiles/* 整片换掉，而用户在设置界面写的自定义供应商/默认模型就住在这份
+      // 文件的尾部（cordis*.yml 是工厂基线与用户配置共用的一份文件）。不合并回来 = 每次升级都把
+      // 供应商配置删掉 → 会话里的模型串悬空 → 发消息只回 NO_ADAPTER。逐块三方合并，best-effort。
+      ProfileConfigMerge.mergeBack(dsh, profileHeld)
       extractToolAssets() // 内置工具/ubuntu rootfs 解压（非致命，失败仅记录）
       if (restoreUserData(backup, dsh)) backup.deleteRecursively()
       fingerprintFile().writeText(bundledFingerprint())
@@ -563,7 +569,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
    *
    * 判据只用一次真实 execve 尝试 + 一个 bionic 对照，绝不做「文件在=能用」的假阳性推断：
    *  - 无 ubuntu-rootfs 资产 → 无可决策项，直接放行且不碰探针文件；
-   *  - `/system/bin/su` 可执行 → proot-entry 走 root chroot，与内核闸无关 → 可用；
+   *  - 任一 su 候选可执行（`SU_CANDIDATES`，含 /product/bin/su 等 Magisk/KernelSU 落点）→ proot-entry 走 root chroot，与内核闸无关 → 可用；
    *  - 对照（/system/bin/echo）自己就 spawn 不起来 → 分不清闸的是 ELF 还是进程创建，探针不可信
    *    → 判「不阻断」照常解压（**绝不让设备比修复前更糟**）；
    *  - 对照通过、glibc 候选全数 EACCES/ENOEXEC → 判阻断 → 跳过 307MB 解压。
@@ -572,9 +578,16 @@ class EngineManager(private val context: Context, private val pickToken: String?
    */
   private class ContainerProbe(val blocked: Boolean, val reason: String, val su: Boolean)
 
+  /**
+   * Magisk / KernelSU 的 su 常不在 `/system/bin`（实测这台 OnePlus 上是 `/product/bin/su -> ./magisk`），
+   * 只查 `/system{,/x}bin/su` 会把已 root 的机器误判成无 su → 探针判死 → 明明能走 chroot 却降级成 proot
+   * 又被内核拒。逐个候选 `canExecute`（保守：只认「文件在场且可执行」，Magisk 的按 uid 授权策略留给
+   * 运行期 chroot 分支去撞，撞不开由 ubuntu_exec 如实回错），并留 `DSH_SU_BIN` 覆盖口子给特殊 ROM。
+   * proot-entry 的 root 分支用同一批候选路径自行发现 su，两处判据对齐（见 writeProotEntry）。
+   */
   private fun suAvailable(): Boolean =
     try {
-      arrayOf("/system/bin/su", "/system/xbin/su").any { File(it).canExecute() }
+      SU_CANDIDATES.any { File(it).canExecute() }
     } catch (_: Throwable) {
       false
     }
@@ -973,6 +986,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
     writeFakeSysdata(entry.parentFile)
     val prootBin = File(operitNativeDir, "proot").absolutePath
     val loaderBin = File(operitNativeDir, "loader").absolutePath
+    val suCandidatesShell = SU_CANDIDATES.joinToString(" ")
     val script = """#!/bin/bash
 # Seagull DevStudio Ubuntu container entry (rootfs top-level)
 # 优先 root chroot（KernelSU/Magisk su 可用时）；无 root 时 fallback proot。
@@ -980,9 +994,16 @@ ROOTFS_DIR="${'$'}(cd "${'$'}(dirname "${'$'}{BASH_SOURCE[0]}")" && pwd)"
 # 提取命令：兼容 `-lc CMD`（ubuntu_exec 默认）与直接 `CMD...`。
 if [ "${'$'}{1:-}" = "-lc" ] || [ "${'$'}{1:-}" = "-c" ]; then CMD="${'$'}{2:-}"; else CMD="${'$'}*"; fi
 # ---- Root chroot 路径（su 可用时）----
-if [ -x /system/bin/su ]; then
+# su 落点按候选逐个发现（EngineManager.SU_CANDIDATES，与容器探针对齐）：Magisk/KernelSU 常在
+# /system/bin 之外（这台 OnePlus 在 /product/bin/su），只认 /system/bin/su 会让已 root 机器走不到这里。
+SU=""
+for _su in ${suCandidatesShell}; do
+  [ -x "${'$'}_su" ] && SU="${'$'}_su" && break
+done
+[ -n "${'$'}SU" ] || SU="${'$'}(command -v su 2>/dev/null || true)"
+if [ -n "${'$'}SU" ]; then
   CMD_B64="${'$'}(printf '%s' "${'$'}CMD" | base64 | tr -d '\n')"
-  exec /system/bin/su -c "export PATH=/system/bin:/system/xbin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='${'$'}ROOTFS_DIR'; mount -t proc proc \"\${'$'}R/proc\" 2>/dev/null; mount -t sysfs sys \"\${'$'}R/sys\" 2>/dev/null; mount -o bind /dev \"\${'$'}R/dev\" 2>/dev/null; mount -t devpts devpts \"\${'$'}R/dev/pts\" 2>/dev/null; mkdir -p \"\${'$'}R/tmp\" \"\${'$'}R/run\"; chmod 1777 \"\${'$'}R/tmp\" 2>/dev/null; [ -s \"\${'$'}R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\${'$'}R/etc/resolv.conf\"; C=\$(printf '%s' '${'$'}CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\${'$'}R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\${'$'}C\""
+  exec "${'$'}SU" -c "export PATH=/system/bin:/system/xbin:/product/bin:/system/usr/bin; export LD_LIBRARY_PATH=/system/lib64:/system/lib; export LD_PRELOAD=; R='${'$'}ROOTFS_DIR'; mount -t proc proc \"\${'$'}R/proc\" 2>/dev/null; mount -t sysfs sys \"\${'$'}R/sys\" 2>/dev/null; mount -o bind /dev \"\${'$'}R/dev\" 2>/dev/null; mount -t devpts devpts \"\${'$'}R/dev/pts\" 2>/dev/null; mkdir -p \"\${'$'}R/tmp\" \"\${'$'}R/run\"; chmod 1777 \"\${'$'}R/tmp\" 2>/dev/null; [ -s \"\${'$'}R/etc/resolv.conf\" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > \"\${'$'}R/etc/resolv.conf\"; C=\$(printf '%s' '${'$'}CMD_B64' | base64 -d 2>/dev/null); exec chroot \"\${'$'}R\" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=xterm LANG=C.UTF-8 TMPDIR=/tmp /bin/bash -lc \"\${'$'}C\""
 fi
 # ---- proot fallback ----
 # PROOT_TMP_DIR 要的是「能建出来且可写」的目录：TMPDIR 由壳侧 shellEnv() 注入（files/home/tmp），
@@ -2123,6 +2144,15 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
 
   companion object {
     private const val TAG = "dsh-engine"
+
+    /**
+     * su 发现候选（探针与 proot-entry root 分支共用同一批，坑 84「已 root 设备恢复解压」判据的单一真源）。
+     * Magisk/KernelSU 落点五花八门，`/system/bin` 只是其中一格——这台 OnePlus 实测在 `/product/bin/su`。
+     */
+    private val SU_CANDIDATES = arrayOf(
+      "/system/bin/su", "/system/xbin/su", "/sbin/su", "/product/bin/su",
+      "/product/xbin/su", "/vendor/bin/su", "/apex/com.android.runtime/bin/su", "/system_ext/bin/su",
+    )
 
     /** 工具资产解压并发锁（MainActivity/EngineService 双实例可能并发 startEngine）。 */
     private val TOOL_EXTRACT_LOCK = Any()

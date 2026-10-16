@@ -93,11 +93,21 @@ async function smokeContainer(timeoutMs) {
   return { ok: false, reason: classifyFailure(out), tail: tailOut(out).split('\n').slice(0, 3).join('\n') };
 }
 
+// su 落点候选，与壳侧 EngineManager.SU_CANDIDATES 对齐（坑 84 ⑤：改判据两侧同改）。Magisk/KernelSU
+// 常在 /system/bin 之外（实测 OnePlus 在 /product/bin/su -> ./magisk），只认 /system/bin/su 会把
+// 已 root 机器误判成无 su → ubuntu_status 报 su:false、ubuntu_exec 走不到 chroot 逃生通道。
+const SU_CANDIDATES = [
+  '/system/bin/su', '/system/xbin/su', '/sbin/su', '/product/bin/su',
+  '/product/xbin/su', '/vendor/bin/su', '/apex/com.android.runtime/bin/su', '/system_ext/bin/su',
+];
+
+function suBin() {
+  for (const p of SU_CANDIDATES) { try { fs.accessSync(p, fs.constants.X_OK); return p; } catch {} }
+  return null;
+}
+
 function hasSu() {
-  try {
-    fs.accessSync('/system/bin/su', fs.constants.X_OK);
-    return true;
-  } catch { return false; }
+  return suBin() !== null;
 }
 
 
@@ -144,7 +154,7 @@ function tools() {
             error: 'Ubuntu 容器在本机被判定不可用（' + cached.reason + '），已跳过执行以免空耗超时；' +
               '判据来自上一次真实冒烟：' + (cached.tail || '(无 stderr 记录)'),
             hint: '内核对 app 私有目录下的非 bionic ELF 直接 EACCES（Android 16+ / 鸿蒙卓易通实测），proot 与其 loader/guest ld.so 都过不去；' +
-              '没有 /system/bin/su 时也没有 chroot 逃生通道。要么在已 root 的设备上用（proot-entry 会自动走 root chroot），' +
+              '没有 su（Magisk/KernelSU 的 su 落点不限于 /system/bin/su，也可能在 /product/bin/su 等）时也没有 chroot 逃生通道。要么在已 root 的设备上用（proot-entry 会自动走 root chroot），' +
               '要么改用宿主 Termux 侧的按需安装器（tool_install）与 APK 内置二进制。确认要重试请传 force="1"。',
           };
         }
@@ -240,7 +250,7 @@ function tools() {
         message: s.ok ? '容器可用：已用 bash -lc true 走通 proot-entry 全链。'
           : `容器不可用（${s.reason}）。在场≠可用：rootfs 完整（usr/bin/bash ${st.size}B）但执行链被拒——` +
             'Android 16+ / 鸿蒙内核对 app 私有目录里的非 bionic ELF 直接 EACCES，' +
-            'proot 的 loader 与 guest ld.so 全在这一条上；无 /system/bin/su 时没有 chroot 逃生通道。',
+            'proot 的 loader 与 guest ld.so 全在这一条上；无 su（落点不限于 /system/bin/su）时没有 chroot 逃生通道。',
       };
     },
   });
@@ -265,7 +275,7 @@ function tools() {
       const extra = String(packages || '').trim().split(/\s+/).filter((p) => /^[A-Za-z0-9._+-]+$/.test(p)).map((p) => shQuote(p)).join(' ')
         || 'build-essential cmake git python3';
       const pkgs = extra;
-      // 探测 root 通道：/system/bin/su 可执行 = proot-entry.sh 会走 root chroot（apt 可靠）；
+      // 探测 root 通道：任一 su 候选可执行（SU_CANDIDATES，与壳侧对齐）= proot-entry.sh 会走 root chroot（apt 可靠）；
       // 否则纯 proot，dpkg 触发 SYSCONFDIR 限制（坑13），如实降级报告。
       const hasRoot = hasSu();
 
@@ -276,7 +286,7 @@ function tools() {
       if (!hasRoot) {
         return {
           ok: false, rootRequired: true,
-          error: '未检测到 root 通道（/system/bin/su 不可执行）：纯 proot 下 apt/dpkg 会触发 SYSCONFDIR 沙箱限制（坑13），无法可靠安装工具链。请在已 root 的设备上重试，或改用宿主 Termux 的按需安装器。',
+          error: '未检测到 root 通道（SU_CANDIDATES 各落点均不可执行，含 /system/bin/su、/product/bin/su 等）：纯 proot 下 apt/dpkg 会触发 SYSCONFDIR 沙箱限制（坑13），无法可靠安装工具链。请在已 root 的设备上重试，或改用宿主 Termux 的按需安装器。',
         };
       }
       try {
