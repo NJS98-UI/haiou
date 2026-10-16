@@ -124,6 +124,39 @@ object EngineProbe {
   }
 
   /**
+   * Authenticated GET against the engine with one transparent re-auth on 401.
+   * 坑 79：探活要看「插件树内部」而不只是 HTTP——引擎自己注册的路由在插件没激活时
+   * 返回 404（not found），这正是「HTTP 健康但引擎死在里面」的确定性信号。
+   * @return HTTP code + body prefix; code -1 when the engine is unreachable.
+   */
+  @Synchronized
+  fun get(path: String, timeoutMs: Int = 2000): Pair<Int, String> {
+    for (attempt in 0..1) {
+      try {
+        val conn = URL(ENGINE_URL + path).openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = timeoutMs
+        conn.readTimeout = timeoutMs
+        conn.instanceFollowRedirects = false
+        sessionCookie(force = attempt > 0)?.let { conn.setRequestProperty("Cookie", it) }
+        val code = conn.responseCode
+        val text = runCatching {
+          (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }?.take(400)
+        }.getOrNull() ?: ""
+        conn.disconnect()
+        if (code == 401 && attempt == 0) {
+          cachedToken = null // 引擎重启过：重读 banner 再试一次
+          continue
+        }
+        return code to text
+      } catch (_: Exception) {
+        return -1 to ""
+      }
+    }
+    return -1 to ""
+  }
+
+  /**
    * One-shot reachability probe. Safe on any thread (never the main thread).
    * Running = the web host answers the authenticated index request
    * (303 token exchange or 200 with a live cookie). A 401 rotates the cached

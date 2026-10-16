@@ -88,7 +88,11 @@ object StorageHeal {
    * @return true = 磁盘已改动，必须重启引擎才生效（调用方负责重启一次）。
    */
   fun fromLogDelta(context: Context, delta: String): Boolean {
-    if (!delta.contains("StorageError: unit '")) return false
+    // 预筛只认「带引号的单元名」这一必要形态：坑 78 里曾按 `StorageError: unit '` 全前缀过滤，
+    // 可引擎的激活诊断把错误摊成 `phase: message` 或多行 stack，前缀不一定原样出现
+    // （真机见过 `StorageError: unit 'workspace': ...` 与 `unit 'workspace': ...` 两种）。
+    // 正则本身才是判据，前缀闸只会漏判。
+    if (!delta.contains("unit '")) return false
     var healed = false
     for (m in VERSION_MISMATCH.findAll(delta)) {
       val unit = m.groupValues[1]

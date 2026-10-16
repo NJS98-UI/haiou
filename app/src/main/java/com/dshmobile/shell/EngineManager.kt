@@ -100,10 +100,34 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * after; factory profiles (cordis*.yml/node_modules) follow the snapshot (manual patches must be
    * re-applied on top of the new baseline). On any failure: restore the backup and keep the old runtime
    * (retried on next start).
+   *
+   * 坑 79（2026-10-16）：这里**绝不让位/删除**在跑的 `usr` 树。真机两轮实测（同日）证明
+   * 「先把老树 rename 走再解压」不能自动化：让位之后设备在整整一轮解压里**没有任何可用运行时**
+   * （用户视角=「都启动不了了」；同机抽样到树大小在 848MB~1.19GB 之间反复跳动，说明还会被重复
+   * 让位）；解压被杀进程/重启/空间不足打断时，唯一可用基线已被自己移走，回滚无从回滚；每轮中断
+   * 再留下一份 1GB+ 的 `usr-stale-*`，可用地盘逐轮变小、越修越坏。
+   * [extractSnapshot] 是叠加式解压，且软链/文件分支会先 `deleteForOverwrite` 清掉同路径的旧目录，
+   * 所以「原地重抽」本身就足以把混血树里被旧包占据的路径全部换回快照版本（真机实测整棵 1.19GB
+   * 归档过一遍 108s，`usr/bin/node` 全程在场）；剩下唯一旧树残留是指向已消失 store 目录的
+   * 悬空软链，由 [rebuildRuntime] 的重抽后清理负责（见该函数）。
    */
   fun refreshSnapshot(onProgress: (Long, Long) -> Unit): Boolean {
+    synchronized(SNAPSHOT_REFRESH_LOCK) {
+      if (snapshotFresh()) return true // 前人抽完了：不再动盘
+      return refreshSnapshotLocked(onProgress)
+    }
+  }
+
+  /**
+   * **必须全程独占**（companion 级锁）：真机实测过并发代价——处置线程在重抽时，界面侧
+   * `startEngine()` 看指纹不新鲜会**再起一次重抽**，两个抽取器在同一棵 `usr` 上交错写，
+   * 结果是一棵「`@deepseek-ai` 全在、扁平依赖只剩 29 个」的残树（引擎直接
+   * `ERR_MODULE_NOT_FOUND: js-yaml` 起不来）。后来者在锁上排队，拿到锁时树已被前人抽好。
+   */
+  private fun refreshSnapshotLocked(onProgress: (Long, Long) -> Unit): Boolean {
     val backup = File(context.filesDir, ".dsh-backup")
     val dsh = File(homeDir, ".dsh")
+    EngineManager.runtimeRefreshInProgress = true
     try {
       if (dsh.exists()) {
         backup.deleteRecursively()
@@ -124,6 +148,15 @@ class EngineManager(private val context: Context, private val pickToken: String?
         Log.e(TAG, "snapshot refresh: extract failed, kept old runtime")
         return false
       }
+      // 叠加解压不会把树「抽空」，但中断（ENOSPC / 进程被杀 / deleteForOverwrite 与写入之间被切）
+      // 会留下一棵半树。核验不过就不写指纹：下一轮启动看到指纹不新鲜会再重抽补完。
+      val missing = extractionSentinels().filter { !it.exists() }
+      if (missing.isNotEmpty()) {
+        if (restoreUserData(backup, dsh)) backup.deleteRecursively()
+        Log.e(TAG, "snapshot refresh: extracted tree incomplete, missing " + missing.joinToString(",") { it.name })
+        LogCollector.log(TAG, "快照重抽核验失败（残树）: " + missing.first().path.removePrefix(context.filesDir.absolutePath + "/"))
+        return false
+      }
       extractToolAssets() // 内置工具/ubuntu rootfs 解压（非致命，失败仅记录）
       if (restoreUserData(backup, dsh)) backup.deleteRecursively()
       fingerprintFile().writeText(bundledFingerprint())
@@ -136,7 +169,75 @@ class EngineManager(private val context: Context, private val pickToken: String?
       backup.deleteRecursively()
       Log.e(TAG, "snapshot refresh failed; kept old runtime", t)
       return false
+    } finally {
+      EngineManager.runtimeRefreshInProgress = false
     }
+  }
+
+  /**
+   * 新树完整性锚点：引擎启动路径上必然被解析的四处落点（node 本体、聚合包入口、真机残树事故里
+   * 最先缺失的那类扁平依赖、web profile 清单）。只验「在场」不验内容——目的是拒绝「抽了一半」，
+   * 逐字节核验由 `installEnginePackages()`/补丁通道的指纹负责。
+   */
+  private fun extractionSentinels(): List<File> = listOf(
+    File(usrDir, "bin/node"),
+    File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js"),
+    File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules/js-yaml/package.json"),
+    File(homeDir, ".dsh/profiles/web/package.json"),
+  )
+
+  /**
+   * 运行环境重建（坑 79 升级阶梯第 2 档）：清指纹 + 从 APK 内嵌快照重抽 + 清理混血树残留的
+   * 悬空软链。用户数据（会话/工作区/凭据/设置）一律不动，`usr` 树全程在场（叠加式重抽只覆盖、
+   * 不清空），所以这一档即使中途被杀也只会留下「部分文件是新版本」的树——下次启动看到指纹不
+   * 新鲜会自动补完，绝不出现「没有运行时」的空窗。
+   *
+   * 清指纹必须**在锁内**做：指纹是「要不要重抽」的判据，锁外先删，界面侧 `startEngine`
+   * 会在我们解压途中看到不新鲜的指纹再起一次重抽——两抽交错就是一棵残树（真机实锤）。
+   * @return true = 重抽成功且新树核验通过（调用方负责重启引擎验证）
+   */
+  fun rebuildRuntime(): Boolean {
+    synchronized(SNAPSHOT_REFRESH_LOCK) {
+      LogCollector.log(TAG, "runtime rebuild: re-extracting embedded snapshot, user data kept")
+      fingerprintFile().delete()
+      val ok = refreshSnapshotLocked({ _, _ -> })
+      val pruned = if (ok) pruneDanglingLinks(File(usrDir, "lib/node_modules")) else 0
+      LogCollector.log(TAG, "runtime rebuild " + (if (ok) "done (dangling links pruned: $pruned)" else "FAILED (old runtime kept)"))
+      return ok
+    }
+  }
+
+  /**
+   * 混血树的另一半病灶：旧快照留下的软链指向已经不存在的 store 目录，`require` 解析到它就直接
+   * 抛错/找不到包，插件在初始化期挂掉、服务永不注册（坑 79 的 workspaceRegistry 链）。
+   * 判据收窄到「本身是软链且目标不存在」——这类链接被解析时必然失败，删它不可能让树更坏；
+   * 不跟随软链、不碰真实目录与文件。必须重抽**之后**再清：重抽会补回快照自带的 store 目录，
+   * 抽前悬空的链接抽后可能已经有效。
+   */
+  private fun pruneDanglingLinks(root: File): Int {
+    if (!root.exists()) return 0
+    var pruned = 0
+    val continue_ = java.nio.file.FileVisitResult.CONTINUE
+    try {
+      java.nio.file.Files.walkFileTree(root.toPath(), object : java.nio.file.FileVisitor<java.nio.file.Path> {
+        override fun preVisitDirectory(dir: java.nio.file.Path, attrs: java.nio.file.attribute.BasicFileAttributes) = continue_
+        override fun visitFile(file: java.nio.file.Path, attrs: java.nio.file.attribute.BasicFileAttributes): java.nio.file.FileVisitResult {
+          if (attrs.isSymbolicLink && !java.nio.file.Files.exists(file)) {
+            try {
+              java.nio.file.Files.deleteIfExists(file)
+              pruned++
+            } catch (_: Exception) {
+            }
+          }
+          return continue_
+        }
+        override fun visitFileFailed(file: java.nio.file.Path, exc: java.io.IOException?) = continue_
+        override fun postVisitDirectory(dir: java.nio.file.Path, exc: java.io.IOException?) = continue_
+      })
+    } catch (t: Throwable) {
+      Log.w(TAG, "dangling-link prune aborted", t)
+    }
+    return pruned
   }
 
   /** User-data entries the snapshot ships stripped: the only things a refresh has to carry over. */
@@ -1229,6 +1330,12 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
 
   /** Start the dsh web engine from the embedded snapshot. */
   fun startEngine(port: Int = EngineProbe.ENGINE_PORT): Boolean {
+    // 重抽进行中（升级/阶梯重建）：此刻树里的文件正被覆盖写，spawn 只会拿到半棵树
+    // （真机残树事故的第三种触发面），或直接与解压抢同一批文件。
+    if (EngineManager.runtimeRefreshInProgress) {
+      LogCollector.log(TAG, "engine start deferred: snapshot refresh in progress")
+      return false
+    }
     // 0.13.5（坑 69）：探活需要从 engine.log banner 解析 launch token；app 进程重启后
     // （引擎孤儿保活场景）本方法可能先于 startWithArgs 被调用，这里就绑定日志句柄。
     if (EngineProbe.logFile == null) {
@@ -1715,6 +1822,22 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
 
     /** Process-level start CAS: visible across EngineManager instances (double-start race guard). */
     val STARTING = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 快照重抽独占锁（companion 级，坑 79）：MainActivity 与 EngineService 各持一个
+     * EngineManager，看门狗的升级处置（`rebuildRuntime`）又在第三条线程上——三处都可能
+     * 在指纹不新鲜时各自发起一次重抽。真机实测到两抽交错把 `usr` 写成残树（`@deepseek-ai`
+     * 齐、扁平依赖只剩 29 个 → 引擎 `ERR_MODULE_NOT_FOUND: js-yaml` 起不来）。
+     * 与 `TOOL_EXTRACT_LOCK` 同理：单飞重抽，后到者在锁上排队，拿锁后 `snapshotFresh()` 即为真。
+     */
+    val SNAPSHOT_REFRESH_LOCK = Any()
+
+    /**
+     * 重抽正在进行（`SNAPSHOT_REFRESH_LOCK` 的可见标记）：`startEngine()` 见到就本轮不起——
+     * 锁只能挡另一个重抽，挡不住「树还没落完就 spawn 引擎」，那正是残树崩的第三种走法。
+     */
+    @Volatile
+    var runtimeRefreshInProgress: Boolean = false
 
     /**
      * 引擎进程句柄（2026-10 复盘修复）：进程级共享而非实例字段。MainActivity 与

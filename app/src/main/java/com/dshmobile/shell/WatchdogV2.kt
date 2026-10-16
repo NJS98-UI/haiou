@@ -12,8 +12,10 @@ import java.io.File
 
 /**
  * 看门狗升级（0.13.0 PRD F2/M3.4）：
- * - 深度探活：HTTP 状态码 + 页面心跳 + 插件状态（EngineProbe 扩展：/api/android/privilege/status
- *   可达表示插件树健康）+ 引擎日志尾部异常扫描（engine.log 末尾 fatal/Error 关键字）。
+ * - 深度探活：HTTP 状态码 + 引擎日志增量异常扫描 + **引擎内部服务探活**（0.13.5 坑 79：
+ *   `/api/android/file-incoming` 可答才说明插件树真的装配到位——HTTP 健康但服务缺席时
+ *   进程不崩、界面能开，用户侧却是「工作区加载中 + 无临时工作区 + 发消息没回复」）。
+ *   内部失活只计数不进探活失败语义，处置交给 [EngineRepair] 阶梯（EngineService tick 驱动）。
  * - 熔断与指数退避：连续失败 → 指数退避（5s→10s→20s→40s→80s 封顶），超过熔断阈值（12 次连续失败）
  *   暂停看门狗并记录（界面提示由 GuideChrome 状态区显示），用户交互或探活成功自动复位。
  * - 开机自启：BOOT_COMPLETED 接收器恢复用户上次同意的运行状态（EngineService.userShutdown 持久化）。
@@ -73,23 +75,87 @@ object WatchdogV2 {
     trippedAt = 0L
   }
 
-  /** 深度探活：EngineProbe + 插件/权限端点 + 引擎日志尾部异常扫描。 */
+  /**
+   * 深度探活：EngineProbe + 引擎**内部**服务健康 + 引擎日志异常。
+   *
+   * 坑 79（2026-10-16）：HTTP 应答正常不等于引擎可用。插件框架（dsh-app-boot）按服务注入 gating：
+   * 一个插件在 [cordis.init] 抛错或 import 失败时，进程照跑、web 照答，但它提供的服务永不出现，
+   * 依赖它的插件全挂 pending（waiting for service: workspaceRegistry）——而工作区面板、
+   * 「临时工作区」条目、会话控制器（dsh-api-session-controller 同样注入 workspaceRegistry）
+   * 全在这条依赖链上，用户侧就是「没有临时工作区 + 发消息没回复」。旧实现只看 HTTP 与
+   * 两行日志关键字，对这个状态永远判健康，既不重启也不修复——这才是「同一个 APK，
+   * 测试机好用、我自己的机器不能用」的判定盲区。
+   *
+   * 判据用我们自己插件注册的路由 `/api/android/file-incoming`：dsh-android-file-open 的
+   * inject 含 workspaceRegistry，它没激活（404）就等于注册表缺席。该路由是引擎白名单只读面
+   * （另两个是 `/api/session.cancel` 与 `/api/session.export`；`/api/workspace.list` 这类
+   * 插件 RPC 不对外暴露，一律 404，不能用作探针）。
+   */
   fun deepProbe(context: Context): Boolean {
     val base = EngineProbe.check().optBoolean("running", false)
-    if (!base) return false
+    if (!base) {
+      internalUnhealthyStreak = 0
+      internalHealthy = false // 引擎都不在，谈不上内部健康——病灶窗口未结束
+      return false
+    }
     // 插件树/桥端点（bridge 插件注册；未注册时 404=false 但引擎健康仍算通过——以 base 为准）
     // 2026-08-23 修复：旧代码 (pluginHealth || true) 恒真 —— 白跑一次 HTTP 且死代码。
-    // 桥端点仅用于对时状态采样；日志异常扫描才是探活退出面的信号（插件树近期变化
-    // 由 engine.log 的 "plugin tree failed to load" 捕获）。
     val logDelta = readEngineLogDelta(context)
     // 坑 78：引擎 HTTP 应答正常，但日志里的 StorageError 会让 workspaceRegistry 缺席
     // （工作区一直加载中、发消息没回复）。这里认签名交给存储自愈，改过磁盘就置重启标记。
-    if (StorageHeal.fromLogDelta(context, logDelta)) storageHealApplied = true
+    val rot = takeRotationTail()
+    if (StorageHeal.fromLogDelta(context, if (rot == null) logDelta else logDelta + "\n" + rot)) storageHealApplied = true
     val logOk = !logDelta.contains("UncaughtException") && !logDelta.contains("plugin tree failed to load")
     // F0.3 事件桥消费（2026-08-24）：引擎任务完成标记 → 系统通知（探活成功才消费，避免引擎
     // 挂死时误弹；消费幂等——读完即清）。
     if (logOk) consumeTaskDoneMarkers(context)
+    val internalOk = internalServiceHealth()
+    internalHealthy = internalOk
+    if (internalOk) {
+      internalUnhealthyStreak = 0
+    } else if (System.currentTimeMillis() - EngineManager.lastStartAttemptAt > INTERNAL_GRACE_MS) {
+      internalUnhealthyStreak++
+    }
+    // 内部失活**不并入返回值**：引擎进程活着、HTTP 也好，走「探活失败」那条路会把重启/熔断/
+    // 自动回撤那套崩溃语义搅进来（熔断后看门狗停摆，升级处置反而永远轮不到出手）。
+    // 这里只计数，处置由 EngineService tick 交给 [EngineRepair] 的阶梯。
     return base && logOk
+  }
+
+  /** 内部失活宽限：引擎刚起来这段时间插件树可能仍在装配，不计失活。 */
+  private const val INTERNAL_GRACE_MS = 60_000L
+
+  /** 坑 79 的内部服务探针路由（dsh-android-file-open 注入 workspaceRegistry，它活着=注册表到位）。 */
+  private const val INTERNAL_PROBE_PATH = "/api/android/file-incoming"
+
+  /**
+   * 引擎内部服务健康：file-open 路由可答 = 插件树装配到位。
+   * 连不上/401（会话换代）一律按「无从判定」放行——外部探活与下一轮 tick 会再判。
+   */
+  private fun internalServiceHealth(): Boolean {
+    val (code, _) = EngineProbe.get(INTERNAL_PROBE_PATH)
+    if (code == -1 || code == 401) return true
+    return code in 200..299
+  }
+
+  /** HTTP 正常但插件树内部失活的连续轮数（升级阶梯的触发计数）。 */
+  @Volatile var internalUnhealthyStreak = 0
+    private set
+
+  /**
+   * 最近一轮内部探活的结果。**病灶是否结束只能看它，不能看计数是否为 0**——
+   * 阶梯出手后计数被 `consumeInternalUnhealthy` 归零，而引擎此刻仍在装配（宽限期）或
+   * 依旧失活，此时若按「计数 0」判病灶结束，就会把本轮重启预算清零，阶梯永远升不到
+   * 真正治本的那一档（运行环境重建）。
+   */
+  @Volatile var internalHealthy: Boolean = false
+    private set
+
+  /** 取走「该出手了」信号：达到阈值即归零计数，由处置方（EngineRepair）决定动作。 */
+  fun consumeInternalUnhealthy(threshold: Int = 3): Boolean {
+    if (internalUnhealthyStreak < threshold) return false
+    internalUnhealthyStreak = 0
+    return true
   }
 
   /**
@@ -152,7 +218,20 @@ object WatchdogV2 {
   }
 
   /**
-   * 引擎日志增量读取（2026-10 修复原 engineLogShowsFailure 的固定尾部扫描；坑 78 把它
+   * 轮转件补读（坑 79）：`engine.log` 被轮转后，致命签名可能整个留在 `engine.log.1` 里，
+   * 增量游标从此再也看不见它。轮转发生的那一轮把旧件尾部取回来，**只喂给存储自愈**——
+   * 不并入 logOk 判据，免得历史错误行把「循环重启」的老坑再制造一遍。
+   */
+  @Volatile
+  private var pendingRotationTail: String? = null
+
+  fun takeRotationTail(): String? {
+    val v = pendingRotationTail
+    pendingRotationTail = null
+    return v
+  }
+
+  /** 引擎日志增量读取（2026-10 修复原 engineLogShowsFailure 的固定尾部扫描；坑 78 把它
    * 拆成「读」与「判」两步，判据之外还要给存储自愈认签名）。
    *
    * 只返回上次读取之后**新写入**的内容（上限尾部 64KB），文件变短（rotate/截断）时重置游标。
@@ -167,19 +246,35 @@ object WatchdogV2 {
         return ""
       }
       val len = f.length()
-      if (len < lastLogOffset) lastLogOffset = 0L // rotate/截断：内容已换代
+      if (len < lastLogOffset) {
+        lastLogOffset = 0L // rotate/截断：内容已换代
+        pendingRotationTail = readTail(java.io.File(context.filesDir, "engine.log.1"))
+      }
       val start = maxOf(lastLogOffset, len - 65_536)
       var tail = ""
       if (len > start) {
-        java.io.RandomAccessFile(f, "r").use { raf ->
-          raf.seek(start)
-          val buf = ByteArray((len - start).coerceAtMost(65_536L).toInt())
-          val n = raf.read(buf)
-          tail = String(buf, 0, n.coerceAtLeast(0), Charsets.UTF_8)
-        }
+        tail = readTail(f)
       }
       lastLogOffset = len
       tail
+    } catch (_: Exception) {
+      ""
+    }
+  }
+
+  /** 文件尾部 64KB（读不动就返回空串——自愈宁可不出手，也不误动数据）。 */
+  private fun readTail(f: java.io.File): String {
+    return try {
+      if (!f.exists()) return ""
+      val len = f.length()
+      val start = maxOf(0L, len - 65_536)
+      if (len <= start) return ""
+      java.io.RandomAccessFile(f, "r").use { raf ->
+        raf.seek(start)
+        val buf = ByteArray((len - start).toInt())
+        val n = raf.read(buf)
+        String(buf, 0, n.coerceAtLeast(0), Charsets.UTF_8)
+      }
     } catch (_: Exception) {
       ""
     }

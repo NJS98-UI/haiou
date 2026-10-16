@@ -22,6 +22,21 @@ class EngineService : Service() {
   private lateinit var engineManager: EngineManager
   private var watchdog: ScheduledExecutorService? = null
 
+  /** 坑 79 升级处置在跑（重建是分钟级）：挡住下一轮 tick 再次出手。 */
+  @Volatile
+  private var repairRunning = false
+
+  @Volatile
+  private var repairStartedAt = 0L
+
+  /**
+   * 处置是否「仍在有效进行中」。**必须带上时限**：重建解压没有超时，线程万一卡死，
+   * repairRunning 就永久为真，看门狗会永远走「让路」分支而不重启引擎——
+   * 瘫痪的自愈等于没有自愈（同坑 78 的 half-open 教训）。超过 20 分钟不再让路。
+   */
+  private val repairActive: Boolean
+    get() = repairRunning && System.currentTimeMillis() - repairStartedAt < REPAIR_MAX_MS
+
   override fun onCreate() {
     super.onCreate()
     // C1: reuse the process-level pick token (auth survives watchdog engine restarts, never blank-allow).
@@ -89,6 +104,13 @@ class EngineService : Service() {
             return@scheduleWithFixedDelay
           }
           val healthy = WatchdogV2.deepProbe(this)
+          if (repairActive) {
+            // 升级处置阶梯正在驱动引擎生命周期（重启/运行环境重建是分钟级）：这一轮不记账、
+            // 不重启、不回撤——否则看门狗会在树解到一半时把引擎拉起来（半棵树冷启），
+            // 或让 UndoGate 把「重建期间连不上」当成崩溃去回滚刚让位的旧树。
+            WatchdogV2.refreshWakeLock(this)
+            return@scheduleWithFixedDelay
+          }
           engineManager.onEngineProbe(healthy)
           WatchdogV2.recordProbe(healthy)
           // 坑 78：存储单元自愈改了磁盘（隔离坏单元 / 改写版本号），必须重启引擎才生效——
@@ -97,6 +119,27 @@ class EngineService : Service() {
             LogCollector.log("dsh-watchdog", "storage unit healed; restarting engine to reload registry")
             engineManager.resetCooldown()
             engineManager.startEngine()
+          }
+          // 坑 79：HTTP 健康但插件树内部失活（工作区/会话控制器全挂 pending）——用户侧就是
+          // 「没有临时工作区 + 发消息没回复」。累计到阈值交给升级处置阶梯（重启→运行环境重建→
+          // 引擎数据让位），处置可能耗时分钟级，另起线程并挡住重入。
+          if (healthy && WatchdogV2.internalHealthy) EngineRepair.noteHealthy(this)
+          if (WatchdogV2.consumeInternalUnhealthy() && engineManager.engineReady && !repairRunning) {
+            repairRunning = true
+            repairStartedAt = System.currentTimeMillis()
+            Thread {
+              try {
+                val action = EngineRepair.advance(this@EngineService, engineManager)
+                LogCollector.log("dsh-watchdog", "internal-unhealthy escalation action: " + (action ?: "none (budget exhausted)"))
+              } catch (e: Throwable) {
+                LogCollector.log("dsh-watchdog", "escalation thread died: " + (e.message ?: e.javaClass.simpleName))
+              } finally {
+                repairRunning = false
+                // 处置期间引擎必然连不上（重建分钟级），那是自己制造的失败，不该让熔断
+                // 把看门狗停摆掉——重建完的引擎正等着下一轮探活确认。
+                WatchdogV2.reset()
+              }
+            }.apply { isDaemon = true; name = "dsh-engine-repair"; start() }
           }
           // 唤醒锁续期：engine 常驻超过 30min 后半段无锁（acquire 定时释放）
           WatchdogV2.refreshWakeLock(this)
@@ -155,6 +198,9 @@ class EngineService : Service() {
 
   companion object {
     private const val NOTIFICATION_ID = 2
+
+    /** 升级处置的让路上限（坑 79）：超过它视为处置线程卡死，看门狗恢复正常调度。 */
+    private const val REPAIR_MAX_MS = 20L * 60 * 1000
     /** User-requested shutdown flag: after shutdown the watchdog/onStartCommand no longer raises the engine; the user must start it manually. */
     @Volatile
     var userShutdown = false
