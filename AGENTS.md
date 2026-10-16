@@ -226,6 +226,7 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 - **新增/移除 `build-snapshot-013.mjs` 的 `TARGETS`（含其依赖闭包 BFS 自动带出的包）必须同批改 `scripts/third-party-licenses.json`**，否则云端 `build-apk` 在 `check-third-party.mjs` 报 `矩阵缺条目` 直接拒打包（坑 77）；本机往往没有 WSL/快照构建能力，这条门禁只在 CI 第一次生效，别把「本地 gradle 过了」当成「门禁过了」。许可全文口径以快照内 `usr/share/doc/<pkg>/copyright` 的实际文本为准（例：jq = MIT 许可式全文，oniguruma = BSD-2-Clause 两条款）。
 - 仓库：`LICENSES/`（GPL-2.0/3.0、LGPL-2.1/3.0 全文）+ `THIRD_PARTY_NOTICES.md`（85 组件行清单，含源码要约与再加工工具清单）+ `scripts/third-party-licenses.json`（117 条登记）+ `scripts/check-third-party.mjs`（矩阵覆盖 + copyleft 全文在场，三形态判定）；门禁同时接入本地入口 `build-apk-013.ps1` 与云端入口 `build-apk.mjs`（`.github/workflows/build-apk.yml` 调后者），缺失即拒打包；另有纯静态孪生闸 `check-targets-licenses.mjs`（坑 77，本机无 WSL 也能跑）。
 - APK：`assets/licenses/`（LICENSES + notices，随包分发）。
+- **已知缺口（坑 77 同批发现，未修，防再探）**：`THIRD_PARTY_NOTICES.md` 实测 85 行，而仓库 `snapshot.tar.xz` 的 `usr/var/lib/dpkg/status` 有 115 个包——后加的 proot / openjdk-21 / apksigner / aapt2 与一批音频、X11 依赖共 **34 个包从未进组件清单**（B1 清单不完整；非本轮引入，许可矩阵 `packages` 侧已覆盖，故 `check-third-party.mjs` 不报）。补齐口径 = 对当期快照跑 `node scripts/check-third-party.mjs <usr|--tar <snapshot.tar.xz>> --write-notices THIRD_PARTY_NOTICES.md`，再手工保留 proot 的「经 AAswordman/Operit terminal 子模块编译」来源说明（生成器只会写成 termux-packages 链接，会丢这条 attribution）。
 - 声明文：`docs/RELEASE.md §7`（D 章合规声明 + 源码要约 + 修改工具）。
 
 ## 8. 待办与已知缺口（非本轮范围，记录防止再探）
