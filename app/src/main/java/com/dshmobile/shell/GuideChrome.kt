@@ -42,6 +42,7 @@ internal class GuideCallbacks(
   val onStartEngine: () -> Unit,
   val onOpenConsole: () -> Unit,
   val onCheckUpdate: () -> Unit,
+  val onExportBundle: () -> Unit,
   val onGrantStorage: () -> Unit,
   val onCopyLog: () -> Unit,
 )
@@ -379,11 +380,27 @@ internal fun buildGuideChrome(activity: ComponentActivity, callbacks: GuideCallb
   secondaryRow.addView(consoleButton, half)
   secondaryRow.addView(updateButton, halfEnd)
 
+  // 诊断包导出：引擎起不来时，页面内的「导出调试日志」入口根本到不了（WebView 加载失败），
+  // 所以初始页必须自带一条不依赖引擎的导出通道——它带的现场体检正是判定病灶的依据。
+  val exportRow = LinearLayout(activity).apply {
+    orientation = LinearLayout.HORIZONTAL
+    val lp = LinearLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT, dpix(R.dimen.ds_btn_secondary_height),
+    )
+    lp.topMargin = dpix(R.dimen.ds_space_8)
+    layoutParams = lp
+  }
+  exportRow.addView(
+    makeSecondary(activity.getString(R.string.ds_export_logs), callbacks.onExportBundle),
+    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f),
+  )
+
   val actionBlock = LinearLayout(activity).apply {
     orientation = LinearLayout.VERTICAL
     setPadding(0, dpix(R.dimen.ds_space_12), 0, 0)
     addView(primaryButton)
     addView(secondaryRow)
+    addView(exportRow)
   }
   root.addView(actionBlock)
 

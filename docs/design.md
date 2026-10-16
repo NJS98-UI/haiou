@@ -11,7 +11,8 @@
 - **WebView 消费** `http://127.0.0.1:3080`（快照内 dsh web 服务）；APK 与引擎版本解耦
   （桥协议版本化 `androidBridge.version`）；
 - **引擎不可达时**：原生启动/测试界面（guide view）——状态、解压/更新进度、崩溃横幅、engine.log 摘要、
-  重试/打开控制台/检查更新；引擎崩溃由看门狗自动恢复；
+  重试/打开控制台/检查更新/导出诊断包（与页面内「导出调试日志」同一条通道，不依赖引擎）；
+  引擎崩溃由看门狗自动恢复；
 - **内置控制台**：`assets/console.html` + 快照内嵌 Termux bash 交互终端（`ConsoleActivity`），
   引擎未运行也可排查；
 - **零 fork、零侵入**：页面侧不做任何改动；桥能力全部经 `@JavascriptInterface` 注入。

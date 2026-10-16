@@ -1226,7 +1226,14 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun downloadDebugLogs() {    if (!debugLogging.compareAndSet(false, true)) return
+  /**
+   * 打包「引擎日志（去票）+ 环境信息（含现场体检）」并落盘。
+   *
+   * 两个入口共用这一条通道：页面加号菜单（结果回 JS `__dshExportResult`），以及引擎起不来时
+   * 唯一可达的初始页「导出诊断包」（结果回原生 Toast）——病灶恰恰在那种设备上，导出不能依赖引擎。
+   */
+  private fun runDebugExport(onDone: (Boolean, String) -> Unit) {
+    if (!debugLogging.compareAndSet(false, true)) return
     Thread {
       try {
         val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
@@ -1263,14 +1270,17 @@ class MainActivity : ComponentActivity() {
           cacheFile.inputStream().use { input -> saveToDownloadsStreamed(filename, input) }
           "下载/" + filename
         }
-        pushExportResult(true, "已保存到 $saved")
+        onDone(true, "已保存到 $saved")
       } catch (t: Throwable) {
-        pushExportResult(false, t.message ?: "导出失败")
+        Log.w(TAG, "debug export failed", t)
+        onDone(false, t.message ?: "导出失败")
       } finally {
         debugLogging.set(false)
       }
     }.start()
   }
+
+  private fun downloadDebugLogs() = runDebugExport(::pushExportResult)
 
   /** 调试日志附带的环境信息（不含任何密钥；版本/设备/布局/插件摘要）。 */
   private fun buildDebugInfoText(): String {
@@ -1567,6 +1577,16 @@ class MainActivity : ComponentActivity() {
         onStartEngine = { startEngineFlow() },
         onOpenConsole = { startActivity(Intent(this, ConsoleActivity::class.java)) },
         onCheckUpdate = { startUpdateCheck() },
+        onExportBundle = {
+          runDebugExport { ok, msg ->
+            runOnUiThread {
+              android.widget.Toast.makeText(
+                this@MainActivity, (if (ok) "导出成功：" else "导出失败：") + msg,
+                android.widget.Toast.LENGTH_LONG,
+              ).show()
+            }
+          }
+        },
         onGrantStorage = { openAllFilesAccessSettings() },
         onCopyLog = { copyGuideLog() },
       ),
