@@ -129,6 +129,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val dsh = File(homeDir, ".dsh")
     EngineManager.runtimeRefreshInProgress = true
     try {
+      // 坑 80：备份要能读动，回位才有效——凭据文件带着 group/other 位时引擎本身也起不来，
+      // 这里先收敛权限，再让备份抄一份读得到的现场。
+      enforceOwnerOnlySecrets()
       if (dsh.exists()) {
         backup.deleteRecursively()
         // Only the stripped user-data entries are backed up: profiles/ubuntu-rootfs are
@@ -140,7 +143,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
           val src = File(dsh, name)
           if (src.exists() && !copyUserDataTree(src, File(backup, name))) backupOk = false
         }
-        if (!backupOk) throw java.io.IOException("user data backup incomplete, aborting refresh")
+        // 备份残缺**不再中止重抽**：回位是逐文件合并、现场从不整目录删，备份此刻纯粹是保险。
+        // 为一个读不动的用户文件把整轮重抽卡死，等于让「读盘偶发失败」升级成「这台机器再也修不好」。
+        if (!backupOk) LogCollector.log(TAG, "user data backup incomplete; continuing (restore merges per file, live data is never deleted)")
       }
       val ok = extractSnapshot(onProgress)
       if (!ok) {
@@ -241,14 +246,60 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   /** User-data entries the snapshot ships stripped: the only things a refresh has to carry over. */
-  private val USER_DATA_NAMES = listOf(
-    "sessions", "storages", "attachments",
-    ".credentials.yaml", "settings.yaml", ".anonymous-user-id", ".private-layout",
-  )
+  private val USER_DATA_NAMES = SnapshotExtractor.USER_DATA_NAMES
 
   /** Engine packages whose android-arm64 prebuilt npm never publishes, replaced by the pure-JS
    *  shims under assets/vendor-shims/ (see installVendorShims). */
   private val VENDOR_SHIM_PACKAGES = listOf("node-addon-require-builtin-android-arm64")
+
+  /**
+   * 坑 80（B）：重抽/在线升级时挡住归档对现场用户数据的覆盖写，规则与理由都在
+   * [SnapshotExtractor.liveUserDataGuard]（归档里带的 `settings.yaml` 是出厂 seed 模板，
+   * 而 `dsh-settings` 读它 = 一次性导入并冲掉用户自己的配置）。
+   */
+  private fun isArchiveOverwriteProtected(target: File): Boolean =
+    SnapshotExtractor.liveUserDataGuard(context.filesDir)(target)
+
+  /**
+   * 坑 80（A，真机 2026-10-16 复现）：`dsh-credentials-local` 读凭据文件前先跑
+   * `assertOwnerOnly`，只要 mode 带任何 group/other 位（把 `.credentials.yaml` 置成 0644 即触发）
+   * 它就抛 `credentials-local: … is readable beyond its owner (mode 644)`。这个插件是
+   * `connection (required) credentials` 依赖链的根，它不激活 → `dsh: startup failed:
+   * 1 required plugin did not activate` → 引擎连 32080 端口都不开，用户侧正是
+   * 「没有临时工作区 + 发消息没回复」，而 APK 别的部分一切正常。
+   *
+   * 上游这道闸是故意的（密钥绝不从世界可读的文件里加载），所以修法是把权限收敛回 0600，
+   * 不是打补丁绕过它。0644 在真机上是有来路的：任何经共享存储（FUSE 只给 0644/0777）中转、
+   * 手工编辑、或旧版本落盘的凭据文件——用户设备与测试机的差异正卡在这里。
+   */
+  private fun enforceOwnerOnlySecrets() {
+    val dsh = File(homeDir, ".dsh")
+    for (name in listOf(".credentials.yaml")) {
+      val f = File(dsh, name)
+      if (!f.isFile) continue
+      try {
+        val desired = setOf(
+          java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+          java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+        )
+        val current = java.nio.file.Files.getPosixFilePermissions(f.toPath())
+        if (current != desired) {
+          java.nio.file.Files.setPosixFilePermissions(f.toPath(), desired)
+          LogCollector.log(TAG, "credential store mode tightened to 600: $name (was " +
+            java.nio.file.attribute.PosixFilePermissions.toString(current) +
+            "; the engine refuses any group/other bit and dies as a required plugin)")
+        }
+      } catch (t: Throwable) {
+        // 无 posix 视图的 ROM：退回 File.setReadable/Writable 的 owner-only 形式（同样清 group/other）。
+        try {
+          f.setReadable(false, false); f.setReadable(true, true)
+          f.setWritable(false, false); f.setWritable(true, true)
+          f.setExecutable(false, false)
+        } catch (_: Throwable) {}
+        Log.w(TAG, "credential store chmod fallback used: " + t.message)
+      }
+    }
+  }
 
   /**
    * Copy one user-data subtree without ever following a link: symlinks are recreated as symlinks,
@@ -303,10 +354,27 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   /** Restore the snapshot-stripped user data dirs/files (copied back from the backup into private .dsh).
+   *
+   *  **备份里有的项逐条覆盖回位（备份 = 重抽前一刻的现场）；但绝不先删现场再回滚。**
+   *  旧实现是先 `dst.deleteRecursively()` 再从备份 copy 回去：备份只要是不完整的
+   *  （`copyUserDataTree` 里 ENOSPC/EACCES 逐文件失败、或解压中途进程被杀），这一步就把完好的
+   *  现场数据换成残缺副本，而且是不可逆的——真机用 `chmod 000 .credentials.yaml` 做过这一步，
+   *  现场文件直接没了。
+   *
+   *  更正一处早先的错误归因：`.dsh/settings.yaml`「整个文件消失」不是这条通道吃的，是
+   *  `dsh-settings` 的一次性导入语义（rename 成 `settings.yaml.imported`，见
+   *  [SnapshotExtractor.liveUserDataGuard] 的说明）——真机写进去的标记原文出现在
+   *  `settings.yaml.imported` 里，是它搬走的。
+   *
+   *  为什么备份还要赢过现场：叠加式重抽**确实**会改写用户数据——归档里带着
+   *  `home/.dsh/settings.yaml` 的出厂 seed 模板，重抽时 deleteForOverwrite 会把它盖在用户自己
+   *  那份上面。现在两层一起做：[isArchiveOverwriteProtected] 让模板压根落不了盘，这里再把备份
+   *  盖回来；目录是逐文件合并（备份缺的文件保留现场版本，绝不整目录删），所以备份残缺也不会
+   *  拿走完好数据。
    *  Never throws (Review 2026-08-18 R2): refreshSnapshot's failure branch calls this on a background
    *  thread, so a restore failure must not escape — otherwise the exception kills the thread and the UI
    *  hangs on "Updating runtime…" with no message. Failures only log; the backup is kept for a retry.
-   *  @return true when every entry landed (the caller may then drop the backup). */
+   *  @return true when every entry that needed restoring landed (the caller may then drop the backup). */
   private fun restoreUserData(backup: File, dsh: File): Boolean {
     if (!backup.exists()) return true
     var allOk = true
@@ -315,7 +383,8 @@ class EngineManager(private val context: Context, private val pickToken: String?
         val src = File(backup, name)
         if (!src.exists()) continue
         val dst = File(dsh, name)
-        if (dst.exists()) dst.deleteRecursively()
+        Log.i(TAG, "restore user data from backup: " + name +
+          (if (dst.exists()) " (overwrite back: the archive had a seed template for it)" else ""))
         if (!copyUserDataTree(src, dst)) allOk = false
       } catch (t: Throwable) {
         allOk = false
@@ -339,7 +408,8 @@ class EngineManager(private val context: Context, private val pickToken: String?
   fun extractSnapshot(onProgress: (Long, Long) -> Unit): Boolean {
     return try {
       val fd = context.assets.openFd("snapshot.tar.xz")
-      SnapshotExtractor.extract(context.assets.open("snapshot.tar.xz"), fd.length, usrDir.parentFile, onProgress)
+      SnapshotExtractor.extract(context.assets.open("snapshot.tar.xz"), fd.length, usrDir.parentFile,
+        onProgress, ::isArchiveOverwriteProtected)
       homeDir.mkdirs()
       true
     } catch (t: Throwable) {
@@ -1188,7 +1258,8 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       if (missing == 0) return
       Log.i(TAG, "engine package gap: " + missing + "/" + packages.length() + " absent, extracting engine-packages.tar.xz")
       val fd = context.assets.openFd("engine-packages.tar.xz")
-      SnapshotExtractor.extract(context.assets.open("engine-packages.tar.xz"), fd.length, context.filesDir) { _, _ -> }
+      SnapshotExtractor.extract(context.assets.open("engine-packages.tar.xz"), fd.length, context.filesDir,
+        onProgress = { _, _ -> })
       fd.close()
       Log.i(TAG, "engine packages installed")
     } catch (t: Throwable) {
@@ -1344,6 +1415,7 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     // LD_PRELOAD depends on the snapshot's termux-exec lib: when missing, every child exec fails,
     // and combined with the cooldown window that means a silent 90s engine outage — assert explicitly
     // before starting and fail loudly if absent.
+    enforceOwnerOnlySecrets() // 坑 80：0644 的凭据文件会让 required 插件不激活，引擎整机空壳
     val preload = File(usrDir, "lib/libtermux-exec-ld-preload.so")
     if (!preload.exists()) {
       Log.e(TAG, "engine start failed: termux-exec preload missing at " + preload.absolutePath)

@@ -21,14 +21,49 @@ import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
  */
 object SnapshotExtractor {
 
+  /** 归档里被剥掉的用户数据名（相对 `home/.dsh`）：重抽要靠备份把它们带回来。 */
+  val USER_DATA_NAMES = listOf(
+    "sessions", "storages", "attachments",
+    ".credentials.yaml", "settings.yaml", ".anonymous-user-id", ".private-layout",
+  )
+
+  /**
+   * 现场用户数据（相对 `filesDir/home/.dsh`）：归档重建/在线升级都不许覆盖掉现场已有的那一份。
+   *
+   * 坑 80（真机 2026-10-16 定位到机制）：归档里带的正是 `settings.yaml` 出厂 seed 模板
+   * （scripts/build-snapshot-013.mjs:88 writeFileSync），而 `dsh-settings` 读它的语义是
+   * **一次性导入**：`rename(path, path + ".imported")` 再把各段写进 profile
+   * （node_modules/@deepseek-ai/dsh-settings/lib/index.js:350-362）。于是每落一次模板 =
+   * 下一轮启动就把「`llm-deepseek: {}` / `llm-pi-ai.providers: {}`」当成用户配置导入一遍，
+   * 把用户自己配好的供应商/模型 route 冲掉——用户侧就是「消息发出去没回复」。
+   * 所以判定不看「现场有没有 settings.yaml」，而是「现场有没有导入过的痕迹」：
+   * settings.yaml 或 settings.yaml.imported 任一存在，模板一律不许落盘。
+   */
+  fun liveUserDataGuard(filesDir: File): (File) -> Boolean {
+    val dsh = File(File(filesDir, "home"), ".dsh")
+    return { target ->
+      if (target.parentFile?.absolutePath != dsh.absolutePath) false
+      else if (target.name == "settings.yaml")
+        target.isFile || File(dsh, "settings.yaml.imported").isFile
+      else target.isFile && target.name in USER_DATA_NAMES
+    }
+  }
+
   /**
    * Extract an xz-compressed tar stream.
    * @param input raw xz stream.
    * @param totalBytes expected stream size (for progress; 0 = unknown).
    * @param dest destination root (filesDir; the archive holds usr/ + home/).
    * @param onProgress bytesDone, bytesTotal.
+   * @param protect live paths the archive must never overwrite — see [isProtected] below.
    */
-  fun extract(input: InputStream, totalBytes: Long, dest: File, onProgress: (Long, Long) -> Unit) {
+  fun extract(
+    input: InputStream,
+    totalBytes: Long,
+    dest: File,
+    onProgress: (Long, Long) -> Unit = { _, _ -> },
+    protect: (File) -> Boolean = { false },
+  ) {
     val xz = XZCompressorInputStream(input)
     val tar = TarArchiveInputStream(xz)
     val execFiles = mutableListOf<String>()
@@ -41,6 +76,16 @@ object SnapshotExtractor {
       val target = resolveEntry(dest, destCanon, entry)
       if (target == null) {
         Log.w("dsh-snap", "skipping unsafe tar entry: " + entry.name)
+        entry = tar.nextEntry
+        continue
+      }
+      // 坑 80：归档里的 home/.dsh/settings.yaml 是构建期写死的出厂 seed 模板
+      // （scripts/build-snapshot-013.mjs 的 writeFileSync）。叠加式重抽对它是「删了重写」，
+      // 于是每次升级/运行时重建都把用户自己的 settings.yaml 换成空模板——自定义供应商、
+      // 模型 pin 全没，用户侧就是「消息发出去没回复」。现场已存在受保护的路径时，
+      // 归档里那一份一律不落盘（progress 少计一个文件，无关紧要）。
+      if (protect(target)) {
+        Log.i("dsh-snap", "live file protected from archive overwrite: " + entry.name)
         entry = tar.nextEntry
         continue
       }

@@ -106,6 +106,12 @@ object WatchdogV2 {
     val rot = takeRotationTail()
     if (StorageHeal.fromLogDelta(context, if (rot == null) logDelta else logDelta + "\n" + rot)) storageHealApplied = true
     val logOk = !logDelta.contains("UncaughtException") && !logDelta.contains("plugin tree failed to load")
+    // 坑 80：凭据文件带 group/other 位 → credentials 插件不激活 → required 链全灭、端口不开。
+    // 处置不需要看门狗做额外动作（startEngine 前置的 enforceOwnerOnlySecrets 会在下一次 spawn 前
+    // 收敛成 0600），但要在日志里留一行指名病灶，否则「引擎起不来」只能靠翻 startup 诊断文件。
+    if (logDelta.contains("readable beyond its owner")) {
+      LogCollector.log("dsh-watchdog", "credential store is group/other-readable (pitfall 80); next start will chmod 600 it before spawn")
+    }
     // F0.3 事件桥消费（2026-08-24）：引擎任务完成标记 → 系统通知（探活成功才消费，避免引擎
     // 挂死时误弹；消费幂等——读完即清）。
     if (logOk) consumeTaskDoneMarkers(context)
