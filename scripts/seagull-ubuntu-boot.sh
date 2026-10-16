@@ -53,8 +53,11 @@ mount -t devpts devpts "$ROOTFS/dev/pts" 2>/dev/null
 mount_bind "$FETCHED"    "$C_FETCHED"
 mount_bind "$WORKSPACES" "$C_WORKSPACE"
 
-# 3) DNS（rootfs 若无 resolv.conf 则写占位）
-[ -s "$ROOTFS/etc/resolv.conf" ] || printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > "$ROOTFS/etc/resolv.conf" 2>/dev/null
+# 3) DNS（坑 89：裸 chroot 无 systemd-resolved，出厂 /etc/resolv.conf 是指向 127.0.0.53 的死桩；
+#    旧守卫「非空即保留」让它留着 → apt 永远解析不了域名。改成「无非 127 上游 nameserver 就重写」）
+if ! grep -E '^[[:space:]]*nameserver' "$ROOTFS/etc/resolv.conf" 2>/dev/null | grep -qv '127\.'; then
+  rm -f "$ROOTFS/etc/resolv.conf"; printf 'nameserver 8.8.8.8\nnameserver 114.114.114.114\n' > "$ROOTFS/etc/resolv.conf" 2>/dev/null
+fi
 
 # 4) qemu binfmt（仅当存在静态 qemu-aarch64 注册器时；best-effort，失败不影响原生 arm64 设备）
 [ -x /data/local/tmp/qemu-aarch64-static ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] && {
