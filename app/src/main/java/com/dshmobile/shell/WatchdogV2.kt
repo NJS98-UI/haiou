@@ -81,11 +81,29 @@ object WatchdogV2 {
     // 2026-08-23 修复：旧代码 (pluginHealth || true) 恒真 —— 白跑一次 HTTP 且死代码。
     // 桥端点仅用于对时状态采样；日志异常扫描才是探活退出面的信号（插件树近期变化
     // 由 engine.log 的 "plugin tree failed to load" 捕获）。
-    val logOk = !engineLogShowsFailure(context)
+    val logDelta = readEngineLogDelta(context)
+    // 坑 78：引擎 HTTP 应答正常，但日志里的 StorageError 会让 workspaceRegistry 缺席
+    // （工作区一直加载中、发消息没回复）。这里认签名交给存储自愈，改过磁盘就置重启标记。
+    if (StorageHeal.fromLogDelta(context, logDelta)) storageHealApplied = true
+    val logOk = !logDelta.contains("UncaughtException") && !logDelta.contains("plugin tree failed to load")
     // F0.3 事件桥消费（2026-08-24）：引擎任务完成标记 → 系统通知（探活成功才消费，避免引擎
     // 挂死时误弹；消费幂等——读完即清）。
     if (logOk) consumeTaskDoneMarkers(context)
     return base && logOk
+  }
+
+  /**
+   * 存储自愈已落地的标记（EngineService 每个 tick 用 [consumeStorageHeal] 取一次）：
+   * 单元文件被隔离/改写必须重启引擎才生效，而引擎此刻 HTTP 健康、看门狗自己不会重启它。
+   */
+  @Volatile var storageHealApplied: Boolean = false
+    private set
+
+  /** 取走并清除自愈标记（一次自愈只换一次重启）。 */
+  fun consumeStorageHeal(): Boolean {
+    val v = storageHealApplied
+    storageHealApplied = false
+    return v
   }
 
   /** 引擎事件桥标记文件（dsh-android-bridge 写入 home/.dsh/.task-done.ndjson；经 context 推导）。 */
@@ -134,35 +152,36 @@ object WatchdogV2 {
   }
 
   /**
-   * 引擎日志异常扫描——增量式（2026-10 修复）：只检查上次读取之后**新写入**的内容
-   * （上限尾部 64KB），文件变短（rotate/截断）时重置游标。旧实现固定扫尾部 4KB，
-   * 历史错误行（UncaughtException / plugin tree failed to load）在日志安静期恒驻
-   * 尾部 → 引擎明明健康也恒判失败 → 看门狗循环重启（「用久了老是重启」根因之二）。
+   * 引擎日志增量读取（2026-10 修复原 engineLogShowsFailure 的固定尾部扫描；坑 78 把它
+   * 拆成「读」与「判」两步，判据之外还要给存储自愈认签名）。
+   *
+   * 只返回上次读取之后**新写入**的内容（上限尾部 64KB），文件变短（rotate/截断）时重置游标。
+   * 旧实现固定扫尾部 4KB，历史错误行（UncaughtException / plugin tree failed to load）在日志
+   * 安静期恒驻尾部 → 引擎明明健康也恒判失败 → 看门狗循环重启（「用久了老是重启」根因之二）。
    */
-  private fun engineLogShowsFailure(context: Context): Boolean {
+  private fun readEngineLogDelta(context: Context): String {
     return try {
       val f = java.io.File(context.filesDir, "engine.log")
       if (!f.exists()) {
         lastLogOffset = 0L
-        return false
+        return ""
       }
       val len = f.length()
       if (len < lastLogOffset) lastLogOffset = 0L // rotate/截断：内容已换代
       val start = maxOf(lastLogOffset, len - 65_536)
-      var found = false
+      var tail = ""
       if (len > start) {
         java.io.RandomAccessFile(f, "r").use { raf ->
           raf.seek(start)
           val buf = ByteArray((len - start).coerceAtMost(65_536L).toInt())
           val n = raf.read(buf)
-          val tail = String(buf, 0, n.coerceAtLeast(0), Charsets.UTF_8)
-          found = tail.contains("UncaughtException") || tail.contains("plugin tree failed to load")
+          tail = String(buf, 0, n.coerceAtLeast(0), Charsets.UTF_8)
         }
       }
       lastLogOffset = len
-      found
+      tail
     } catch (_: Exception) {
-      false
+      ""
     }
   }
 

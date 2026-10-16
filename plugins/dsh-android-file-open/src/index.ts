@@ -42,9 +42,15 @@ interface HostSessions {
   create(id?: unknown, opts?: { meta?: Record<string, unknown> }): HostSession
 }
 
-/** workspaceRegistry 最小面（注册临时工作区让面板可见；create 幂等：同路径复用现有实体）。 */
+/** workspaceRegistry 最小面（注册临时工作区让面板可见；create 幂等：同路径复用现有实体，
+ *  但命中已有实体时**不改标题**——registry 也会从既有会话 cwd 以路径末段兜底命名先建好同一路径，
+ *  面板上就显示成「incoming」。见 0.13.5 坑 78 附带修正）。 */
+interface HostWorkspace {
+  readonly title: string
+  setTitle(title: string): Promise<unknown>
+}
 interface HostWorkspaceRegistry {
-  create(path: string, title?: string): Promise<unknown>
+  create(path: string, title?: string): Promise<HostWorkspace | undefined>
 }
 
 interface IncomingItem {
@@ -207,11 +213,16 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}) {
   // 始终看不到「临时工作区」条目（registry 只从既有会话 cwd bootstrap；无会话时为空）。
   // create 幂等且复用同路径实体；标题「临时工作区」让设置页/工作区面板可见可清理。
   if (workspaceRegistry) {
-    try {
-      void workspaceRegistry.create(tmpWorkspace(), '临时工作区')
-    } catch (e) {
-      ctx.logger?.('dsh-android-file-open')?.warn?.('临时工作区登记失败: ' + String((e as Error).message))
-    }
+    const ws = tmpWorkspace()
+    Promise.resolve()
+      .then(() => workspaceRegistry.create(ws, '临时工作区'))
+      .then((entity) => {
+        // create 命中既有实体时保持原标题；只有仍是路径末段兜底名（"incoming"）才纠正，
+        // 用户自己改过名的一律尊重。标题「临时工作区」是设置页清理入口与工作区面板的识别锚。
+        if (entity && entity.title === basename(ws)) return entity.setTitle('临时工作区')
+        return undefined
+      })
+      .catch((e: unknown) => ctx.logger?.('dsh-android-file-open')?.warn?.('临时工作区登记失败: ' + String((e as Error).message)))
   }
   // 启动即补建（引擎重启后队列里可能残留无 sessionId 的条目——幂等）
   try {

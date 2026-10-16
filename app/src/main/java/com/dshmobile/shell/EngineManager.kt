@@ -1286,6 +1286,10 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       killExistingEngine()
       // 0.13.1 W5：坏键迁移必须在引擎读 settings 前完成。
       repairSettingsSeed()
+      // 0.13.5（坑 78）：whole-unit 存储文件（storages/*.json）坏/版本落后会被引擎硬拒，
+      // workspaceRegistry 服务缺席 → 会话/工作区/文件直达插件全部 pending，用户侧表现为
+      // 「工作区一直加载中 + 发消息没回复 + 临时工作区消失」而 HTTP 探活正常。预检隔离。
+      StorageHeal.preflight(context)
       // 0.13.1 W3/W4：共享目录 README 每次启动刷新（此前只在迁移路径调用，正常启动不落盘）。
       ensurePublicExportRepo(dshDataDir)
       installEnginePackages()

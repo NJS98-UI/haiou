@@ -91,6 +91,13 @@ class EngineService : Service() {
           val healthy = WatchdogV2.deepProbe(this)
           engineManager.onEngineProbe(healthy)
           WatchdogV2.recordProbe(healthy)
+          // 坑 78：存储单元自愈改了磁盘（隔离坏单元 / 改写版本号），必须重启引擎才生效——
+          // 此刻 HTTP 探活是健康的，看门狗自己不会重启，所以显式要一次重启（一次自愈一次重启）。
+          if (WatchdogV2.consumeStorageHeal() && engineManager.engineReady) {
+            LogCollector.log("dsh-watchdog", "storage unit healed; restarting engine to reload registry")
+            engineManager.resetCooldown()
+            engineManager.startEngine()
+          }
           // 唤醒锁续期：engine 常驻超过 30min 后半段无锁（acquire 定时释放）
           WatchdogV2.refreshWakeLock(this)
           if (!healthy && engineManager.engineReady) {
