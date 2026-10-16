@@ -30,6 +30,26 @@ object EngineProbe {
   @Volatile private var cachedToken: String? = null
   @Volatile private var cachedCookie: String? = null
 
+  /**
+   * 最近一次从 banner 真读到的票（**不随 invalidateSession 清空**）：只用来判定「换代」，
+   * 不参与任何请求构造，所以它不会把旧票喂给引擎。
+   */
+  @Volatile private var lastSeenToken: String? = null
+
+  /**
+   * 引擎会话代次（坑 82）：每当 banner 里出现一张**与上一代不同**的新票就 +1。
+   *
+   * 为什么界面侧需要它：0.1.7 引擎全路由鉴权（坑 69），WebView 的会话靠 `?token=` 那一次
+   * 303 交换拿到的 cookie。看门狗自愈、坑 78 存储自愈、EngineRepair 阶梯、崩溃重启都会
+   * **在界面毫无察觉的情况下把引擎换代**——旧 cookie 当场失效，页面每个请求都 401：
+   * 用户看到的就是「页面在、没有临时工作区、发消息没回复」，而壳侧 `check()` 自己会重新
+   * 取票、照样报 running=true，于是既不提示也不重载，永远卡死在这一态（重进 App 才临时好）。
+   * 界面侧比对代次即可确定性地知道「手里那份会话已经过期」，见
+   * `MainActivity.navigatedSessionGeneration`。
+   */
+  @Volatile var sessionGeneration: Long = 0L
+    private set
+
   // Banner line: `dsh web: http://127.0.0.1:32080/?token=<base64url>` (LAN variants share the ?token= shape).
   private val TOKEN_LINE = Regex("""dsh web: https?://[^/\s]+/\?token=([A-Za-z0-9_-]+)""")
 
@@ -54,7 +74,16 @@ object EngineProbe {
         String(buf, Charsets.UTF_8)
       }
       val token = TOKEN_LINE.findAll(tail).lastOrNull()?.groupValues?.get(1)
-      if (token != null) cachedToken = token
+      if (token != null) {
+        // 换代判定（坑 82）：读到一张与上一代不同的票 = 引擎重启过，界面上的会话已失效。
+        val previous = lastSeenToken
+        if (previous != null && previous != token) {
+          sessionGeneration++
+          cachedCookie = null
+        }
+        lastSeenToken = token
+        cachedToken = token
+      }
       token
     } catch (_: Exception) {
       null

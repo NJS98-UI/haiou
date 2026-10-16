@@ -86,6 +86,14 @@ class MainActivity : ComponentActivity() {
   /** 用户主动关闭后，前台监控与任何尚未结束的启动线程不得重新展示 WebUI。 */
   @Volatile
   private var userClosedEngine = false
+  /**
+   * 上次带票导航时的引擎会话代次（坑 82）。导航一律走 [navigateToEngine]，所以这个值
+   * 与 [EngineProbe.sessionGeneration] 不一致 = 页面手里那份会话 cookie 已经作废
+   * （引擎在界面不知情的前提下重启换代了），必须重新导航，否则页面每个请求都 401。
+   */
+  private var navigatedSessionGeneration = -1L
+  /** 主线程投递句柄（坑 82：桥线程里的导航要回到主线程执行）。 */
+  private val engineUiHandler = android.os.Handler(android.os.Looper.getMainLooper())
   /** 前台引擎监控：3s 轮询探测，down→测试界面、up→恢复 WebUI
    *  （"设置里杀进程/引擎崩溃回退测试界面"的落地；watchdog 负责恢复）。 */
   private val engineMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -101,6 +109,16 @@ class MainActivity : ComponentActivity() {
               showGuide()
             } else if (running && guideView.visibility == View.VISIBLE) {
               showWeb()
+            } else if (running && webView.visibility == View.VISIBLE &&
+              EngineProbe.sessionGeneration != navigatedSessionGeneration
+            ) {
+              // 坑 82：引擎换代了但界面还带着上一代会话——不重载就永久「有界面、无工作区、发消息没回复」。
+              LogCollector.log(
+                "dsh-shell",
+                "engine session rotated (gen=" + EngineProbe.sessionGeneration +
+                  ", navigated=" + navigatedSessionGeneration + "); re-navigating WebUI",
+              )
+              navigateToEngine()
             }
           }
           if (!userClosedEngine) engineMonitorHandler.postDelayed(monitor, 3000)
@@ -132,7 +150,9 @@ class MainActivity : ComponentActivity() {
         }
         if (!freezeReloaded) {
           freezeReloaded = true
-          try { webView.reload() } catch (_: Exception) {
+          // 坑 82：reload() 重放的是**旧 URL**——里头带的是上一代 launch token，引擎换代后
+          // 它必然 401，刷新等于白刷；一律重新带票导航。
+          try { navigateToEngine() } catch (_: Exception) {
           }
         }
         jsAckAt = now
@@ -878,7 +898,7 @@ class MainActivity : ComponentActivity() {
         onShutdownToGuide = { shutdownToGuide() },
         onReloadWebUI = {
           // 0.13.5（坑 69）：同样重带 launch token 导航（纯 reload 在引擎重启后会 401）。
-          webView.loadUrl(EngineProbe.authenticatedUrl())
+          navigateToEngine()
           showTestNotification("界面已刷新", "Web UI 已重新加载")
         },
         onOpenConsole = { startActivity(Intent(this, ConsoleActivity::class.java)) },
@@ -926,7 +946,7 @@ class MainActivity : ComponentActivity() {
     )
     // 0.13.5（坑 69）：0.1.7 引擎全路由鉴权——WebView 必须带 launch token 载入，
     // 303 交换后 WebView 自己的 cookie jar 承接会话。
-    webView.loadUrl(EngineProbe.authenticatedUrl())
+    navigateToEngine()
   }
 
   /**
@@ -1306,10 +1326,11 @@ class MainActivity : ComponentActivity() {
    * 绝不写任何凭据/配置内容**。
    *
    * 为什么要这一段：用户报障的那台机器连不上调试台，而「没有临时工作区 + 发消息没回复」在
-   * 三处病灶上各有明确指纹——`.credentials.yaml` 带 group/other 位（坑 80，引擎直接不 spawn、
-   * 端口都不开）、`settings.yaml`/`settings.yaml.imported` 的组合（坑 80 二次导入重置供应商
-   * 路由）、`storages/` 被自愈改名（坑 78）、修复阶梯预算（坑 79）。以前这些只能靠 adb +
-   * run-as 现场取，用户侧无从自证；现在一次导出即可判型。
+   * 四处病灶上各有明确指纹——`.credentials.yaml` 带 group/other 位（坑 80，required 插件不
+   * 激活、端口都不开）、`settings.yaml`/`settings.yaml.imported` 的组合（坑 80 二次导入重置
+   * 供应商路由）、`storages/` 被自愈改名（坑 78）、修复阶梯预算（坑 79），以及壳侧根本没
+   * spawn 过引擎（坑 82：只有启动决策台账留痕，engine.log 那时尚不存在）。以前这些只能靠
+   * adb + run-as 现场取，用户侧无从自证；现在一次导出即可判型。
    */
   private fun forensicsText(): String {
     val dsh = File(File(filesDir, "home"), ".dsh")
@@ -1387,6 +1408,21 @@ class MainActivity : ComponentActivity() {
     } catch (t: Throwable) {
       sb.append("  engine.log: read failed ").append(t.javaClass.simpleName).append('\n')
     }
+    // 坑 82：会话票换代与壳侧启动决策台账——「有界面但每个请求 401」和「engine.log 根本不存在」
+    // 这两类现场都只能由这两行判定；票本身绝不落进导出包（只报有/无）。
+    sb.append("  session: tokenInEngineLog=").append(if (EngineProbe.launchToken() != null) "yes" else "no")
+      .append(" generation=").append(EngineProbe.sessionGeneration)
+      .append(" navigated=").append(navigatedSessionGeneration)
+      .append(if (EngineProbe.sessionGeneration != navigatedSessionGeneration)
+        "  <= 壳侧待重新带票导航（页面手里那份会话已失效，监控 3s 内会自愈）" else "")
+      .append('\n')
+    runCatching {
+      val ledger = engineManager.startLedgerTail(12)
+      sb.append("  start ledger: ").append(if (ledger.isEmpty()) "absent (本机没走过任何启动决策分支)" else ledger).append('\n')
+    }
+    sb.append("  all-files-access=").append(
+      if (android.os.Build.VERSION.SDK_INT >= 30) android.os.Environment.isExternalStorageManager() else false,
+    ).append("（坑 81/共享工作区：false 时 dshdata 走「下载/」回落路径）\n")
     val usb = try { org.json.JSONObject(UsbState.state(this)) } catch (_: Throwable) { null }
     sb.append("  usb host=").append(UsbState.hasHostFeature(this))
       .append(" devices=").append(usb?.optInt("count", -1) ?: -1)
@@ -1990,6 +2026,27 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  /**
+   * 带当前 launch token 导航引擎页，并记下这一刻的会话代次（唯一的导航入口，坑 82）。
+   *
+   * 为什么不让各处直接 `webView.loadUrl(EngineProbe.authenticatedUrl())`：
+   * ① 代次必须和「实际喂给页面的那张票」同源，漏记一处就会让监控误判或漏判；
+   * ② 桥回调（`reloadWebUI`）在 JavaBridge 线程上，WebView 的视图方法必须在主线程调用，
+   *    这里统一投递主线程（旧代码从桥线程直接 loadUrl，属于既未定义也易崩的用法）。
+   */
+  private fun navigateToEngine() {
+    if (!::webView.isInitialized) return
+    val url = EngineProbe.authenticatedUrl()
+    navigatedSessionGeneration = EngineProbe.sessionGeneration
+    if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+      webView.loadUrl(url)
+    } else {
+      engineUiHandler.post {
+        if (::webView.isInitialized) webView.loadUrl(url)
+      }
+    }
+  }
+
   private fun showWeb() {
     guideView.visibility = View.GONE
     webView.visibility = View.VISIBLE
@@ -1998,7 +2055,7 @@ class MainActivity : ComponentActivity() {
     // The WebView may have rendered an error page before the engine was
     // ready (engine boot takes seconds); reload now that it answers.
     // 0.13.5（坑 69）：reload 会重放旧 URL——引擎重启后 token 已换代，必须重新带票导航。
-    webView.loadUrl(EngineProbe.authenticatedUrl())
+    navigateToEngine()
   }
 
   /** 进入测试界面（引擎失败/未就绪回退）：状态 + 崩溃横幅 + engine.log 摘要。 */

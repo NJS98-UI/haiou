@@ -128,6 +128,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val backup = File(context.filesDir, ".dsh-backup")
     val dsh = File(homeDir, ".dsh")
     EngineManager.runtimeRefreshInProgress = true
+    noteStartDecision("snapshot refresh: start (engine starts are deferred until this ends)")
     try {
       // 坑 80：备份要能读动，回位才有效——凭据文件带着 group/other 位时引擎本身也起不来，
       // 这里先收敛权限，再让备份抄一份读得到的现场。
@@ -151,6 +152,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
       if (!ok) {
         if (restoreUserData(backup, dsh)) backup.deleteRecursively()
         Log.e(TAG, "snapshot refresh: extract failed, kept old runtime")
+        noteStartDecision("refresh FAILED: extract returned false (old runtime kept)")
         return false
       }
       // 叠加解压不会把树「抽空」，但中断（ENOSPC / 进程被杀 / deleteForOverwrite 与写入之间被切）
@@ -160,12 +162,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
         if (restoreUserData(backup, dsh)) backup.deleteRecursively()
         Log.e(TAG, "snapshot refresh: extracted tree incomplete, missing " + missing.joinToString(",") { it.name })
         LogCollector.log(TAG, "快照重抽核验失败（残树）: " + missing.first().path.removePrefix(context.filesDir.absolutePath + "/"))
+        noteStartDecision("refresh INCOMPLETE: missing " + missing.joinToString(",") { it.name } + " (fingerprint not written)")
         return false
       }
       extractToolAssets() // 内置工具/ubuntu rootfs 解压（非致命，失败仅记录）
       if (restoreUserData(backup, dsh)) backup.deleteRecursively()
       fingerprintFile().writeText(bundledFingerprint())
       Log.i(TAG, "snapshot refreshed (fingerprint " + bundledFingerprint().take(12) + ")")
+      noteStartDecision("refresh done: fingerprint " + bundledFingerprint().take(12))
       return true
     } catch (t: Throwable) {
       restoreUserData(backup, dsh)
@@ -173,6 +177,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
       // rebuilt from .dsh on the next attempt anyway).
       backup.deleteRecursively()
       Log.e(TAG, "snapshot refresh failed; kept old runtime", t)
+      noteStartDecision("refresh THREW: " + (t.message ?: t.javaClass.simpleName))
       return false
     } finally {
       EngineManager.runtimeRefreshInProgress = false
@@ -1399,12 +1404,71 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     }
   }
 
+  /** 启动决策台账文件名（私有 filesDir）。 */
+  private fun startLedgerFile(): File = File(context.filesDir, "engine-start-ledger.txt")
+
+  /**
+   * 记一条「引擎启动决策」（坑 82 取证面）。
+   *
+   * 为什么必须有它：`engine.log` 是**引擎自己**的 stdout，引擎没被 spawn 出来时它根本不存在，
+   * 而 `startEngine()` 里每一条「没走到 spawn 就 return」的出口（重抽让位、preload 缺席、
+   * 冷却窗/冷启动/崩溃限速、启动前置步骤抛异常）此前只进 logcat——用户拿不到，导出包里也看不到，
+   * 于是「这台设备上 engine.log 缺失」就成了无解之谜（鸿蒙卓易通容器实测正是这种零证据现场）。
+   * 台账按启动决策落盘（追加、限长、best-effort），并随「导出诊断包」的现场体检一起带出。
+   */
+  private fun noteStartDecision(reason: String) {
+    try {
+      val f = startLedgerFile()
+      val line = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+        .format(java.util.Date()) + "  " + reason + "\n"
+      synchronized(START_LEDGER_LOCK) {
+        val existing = if (f.isFile) f.readText() else ""
+        val kept = existing.lines().filter { it.isNotBlank() }.takeLast(LEDGER_KEEP_LINES - 1)
+        f.writeText(kept.joinToString("\n", postfix = "\n") + line)
+      }
+    } catch (t: Throwable) {
+      Log.w(TAG, "start ledger write failed (non-fatal): " + t.message)
+    }
+  }
+
+  /** 台账尾部（导出诊断包用）：最多 n 行、绝不抛。 */
+  fun startLedgerTail(n: Int = 12): String {
+    return try {
+      val f = startLedgerFile()
+      if (!f.isFile) return ""
+      synchronized(START_LEDGER_LOCK) {
+        f.readLines().filter { it.isNotBlank() }.takeLast(n).joinToString("; ")
+      }
+    } catch (t: Throwable) {
+      "ledger read failed: " + (t.message ?: t.javaClass.simpleName)
+    }
+  }
+
+  /**
+   * 启动前置步骤的护栏（坑 82 取证 + 可用性）：任一步抛出都只记账、不吞掉整次启动。
+   *
+   * 旧写法把这些步骤整段塞进一个 try，于是一个只在特定 ROM 上失败的前置步骤（例如容器里
+   * 缺 posix 视图、共享目录被厂商 ROM 拒绝）就能让引擎**一次都不被 spawn**——症状比该步骤
+   * 本身严重得多（整机空壳、engine.log 都不存在）。步骤失败最多让某个补丁没打上，
+   * 「引擎带着未打补丁启动」仍然严格优于「引擎不启动」。
+   */
+  private fun runStartStep(name: String, failures: MutableList<String>, block: () -> Unit) {
+    try {
+      block()
+    } catch (t: Throwable) {
+      val msg = name + ": " + (t.message ?: t.javaClass.simpleName)
+      failures.add(msg)
+      Log.e(TAG, "engine start step failed (continuing): $msg", t)
+    }
+  }
+
   /** Start the dsh web engine from the embedded snapshot. */
   fun startEngine(port: Int = EngineProbe.ENGINE_PORT): Boolean {
     // 重抽进行中（升级/阶梯重建）：此刻树里的文件正被覆盖写，spawn 只会拿到半棵树
     // （真机残树事故的第三种触发面），或直接与解压抢同一批文件。
     if (EngineManager.runtimeRefreshInProgress) {
       LogCollector.log(TAG, "engine start deferred: snapshot refresh in progress")
+      noteStartDecision("deferred: runtime refresh in progress")
       return false
     }
     // 0.13.5（坑 69）：探活需要从 engine.log banner 解析 launch token；app 进程重启后
@@ -1415,15 +1479,18 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     // LD_PRELOAD depends on the snapshot's termux-exec lib: when missing, every child exec fails,
     // and combined with the cooldown window that means a silent 90s engine outage — assert explicitly
     // before starting and fail loudly if absent.
-    enforceOwnerOnlySecrets() // 坑 80：0644 的凭据文件会让 required 插件不激活，引擎整机空壳
+    val stepFailures = mutableListOf<String>()
+    runStartStep("owner-only-secrets", stepFailures) { enforceOwnerOnlySecrets() } // 坑 80：0644 的凭据文件会让 required 插件不激活，引擎整机空壳
     val preload = File(usrDir, "lib/libtermux-exec-ld-preload.so")
     if (!preload.exists()) {
       Log.e(TAG, "engine start failed: termux-exec preload missing at " + preload.absolutePath)
+      noteStartDecision("blocked: termux-exec preload absent (" +
+        preload.path.removePrefix(context.filesDir.absolutePath + "/") + ")")
       return false
     }
     // Seagull fork：每次引擎启动前确保内置工具/Ubuntu rootfs 就位（幂等；hasAsset 守卫 + 覆盖写）。
     // 修复：先装无工具首包、后装带工具新包时快照指纹不变 → refreshSnapshot 不跑 → 工具装不上。
-    extractToolAssets()
+    runStartStep("tool-assets", stepFailures) { extractToolAssets() }
     val now = System.currentTimeMillis()
     // Process-level CAS: only one concurrent call really starts (device-measured EADDRINUSE double-start).
     if (!STARTING.compareAndSet(false, true)) return true
@@ -1441,6 +1508,7 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       if (engineReachable) {
         STARTING.set(false)
         LogCollector.log(TAG, "engine start skipped (cooldown window; engine reachable)")
+        noteStartDecision("skipped: cooldown and engine reachable")
         return true
       }
       // 冷启动保护（2026-10 循环重启修复）：引擎进程活着 = 正在冷启动（20-45s 内探活
@@ -1450,12 +1518,15 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       if (engineProcessAlive()) {
         STARTING.set(false)
         LogCollector.log(TAG, "engine start skipped (cold boot in progress; process alive)")
+        noteStartDecision("skipped: cold boot in progress (process alive)")
         return true
       }
       // 进程已死（启动即崩）：崩溃循环限速，避免每 5s 一次的 kill-restart 风暴。
       if (now - EngineManager.lastStartAttemptAt < CRASH_RETRY_MIN_MS) {
         STARTING.set(false)
         LogCollector.log(TAG, "engine start skipped (crash retry throttle)")
+        noteStartDecision("skipped: crash retry throttle (" +
+          (now - EngineManager.lastStartAttemptAt) + "ms since last start)")
         return true
       }
       LogCollector.log(TAG, "engine start: cooldown bypassed (engine process dead " + (now - EngineManager.lastStartAttemptAt) + "ms after last start)")
@@ -1464,15 +1535,21 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       // 旧进程清理：无论句柄是否还在，先终结残留（引擎挂死/内存里 fork 掉的孤儿）。
       killExistingEngine()
       // 0.13.1 W5：坏键迁移必须在引擎读 settings 前完成。
-      repairSettingsSeed()
+      runStartStep("repair-settings-seed", stepFailures) { repairSettingsSeed() }
       // 0.13.5（坑 78）：whole-unit 存储文件（storages/*.json）坏/版本落后会被引擎硬拒，
       // workspaceRegistry 服务缺席 → 会话/工作区/文件直达插件全部 pending，用户侧表现为
       // 「工作区一直加载中 + 发消息没回复 + 临时工作区消失」而 HTTP 探活正常。预检隔离。
-      StorageHeal.preflight(context)
+      runStartStep("storage-preflight", stepFailures) { StorageHeal.preflight(context) }
       // 0.13.1 W3/W4：共享目录 README 每次启动刷新（此前只在迁移路径调用，正常启动不落盘）。
-      ensurePublicExportRepo(dshDataDir)
-      installEnginePackages()
-      applyRuntimePatches()
+      runStartStep("public-export-repo", stepFailures) { ensurePublicExportRepo(dshDataDir) }
+      runStartStep("engine-packages", stepFailures) { installEnginePackages() }
+      runStartStep("runtime-patches", stepFailures) { applyRuntimePatches() }
+      if (stepFailures.isNotEmpty()) {
+        // 带着「某个前置步骤没做成」照样启动：那最多是某个补丁没打上（引擎会按未打补丁的
+        // 上游行为跑），而因为这些步骤里某一步抛异常就不 spawn，代价是整机空壳、
+        // 连 engine.log 都不会存在——真机上更坏得多的结果。
+        noteStartDecision("pre-spawn steps failed (continuing): " + stepFailures.joinToString(", "))
+      }
       // --no-open: the engine must never try to open a desktop browser on Android
       // (the WebView IS the UI). Without it, rc.2's spawn xdg-open on a missing
       // binary stalls engine serve on some emulators (MuMu root observed);
@@ -1483,11 +1560,15 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       EngineManager.engineProcess = startWithArgs(args, shellEnv())
       // The cooldown is written only after a real start: failure paths don't consume the window (retry is immediate).
       EngineManager.lastStartAttemptAt = now
+      noteStartDecision("spawn attempted ok: port=" + port +
+        (if (stepFailures.isEmpty()) "" else " (steps failed: " + stepFailures.joinToString(", ") + ")"))
       LogCollector.log(TAG, "engine started")
       true
     } catch (t: Throwable) {
       Log.e(TAG, "engine start failed", t)
       LogCollector.log(TAG, "engine start FAILED: " + (t.message ?: t.javaClass.simpleName))
+      noteStartDecision("spawn FAILED: " + (t.message ?: t.javaClass.simpleName) +
+        " (node=" + nodeBin.exists() + " dshBin=" + dshBin.exists() + ")")
       // 0.13.1 W3：失败现场镜像到共享目录（此前 engine.log 只在私有域，外界拿不到）。
       mirrorDiagnosticsToShared("engine-spawn-failed")
       false
@@ -1520,6 +1601,9 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
     } catch (e: java.io.IOException) {
       if (e.message?.contains("Permission denied") != true) throw e
       Log.w(TAG, "direct exec denied, falling back to linker64: " + e.message)
+      // 坑 82 取证：这条回退路径是厂商 ROM（执行位/xattr 策略不同）上唯一能起来的机会，
+      // 必须留痕——否则台账只会记到外层「spawn FAILED」，看不出直连 exec 曾被拒。
+      noteStartDecision("direct exec denied (" + e.message + "), retrying via linker64")
       build(listOf("/system/bin/linker64") + args.toList()).start()
     }
   }
@@ -1903,6 +1987,12 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
      * 与 `TOOL_EXTRACT_LOCK` 同理：单飞重抽，后到者在锁上排队，拿锁后 `snapshotFresh()` 即为真。
      */
     val SNAPSHOT_REFRESH_LOCK = Any()
+
+    /** 启动决策台账写入锁（多 EngineManager 实例 / 看门狗与界面并发追加）。 */
+    val START_LEDGER_LOCK = Any()
+
+    /** 台账保留行数：够看清「这一轮为什么没 spawn」，又不会让私有目录里长出大文件。 */
+    const val LEDGER_KEEP_LINES = 60
 
     /**
      * 重抽正在进行（`SNAPSHOT_REFRESH_LOCK` 的可见标记）：`startEngine()` 见到就本轮不起——
