@@ -1238,7 +1238,11 @@ class MainActivity : ComponentActivity() {
           val log = File(filesDir, "engine.log")
           if (log.exists()) {
             zos.putNextEntry(java.util.zip.ZipEntry("engine.log"))
-            log.inputStream().use { it.copyTo(zos) }
+            // 引擎启动横幅会打印 `…/?token=<launch token>`：那是本回合的循环地址会话票，
+            // 诊断价值为零而导出包会被转发（发给我们看日志），落盘前先抹。
+            val redacted = log.readText().replace(Regex("(?i)([?&]token=)[0-9A-Za-z_-]{8,}"), "$1***")
+              .toByteArray(Charsets.UTF_8)
+            zos.write(redacted)
             zos.closeEntry()
           }
           zos.putNextEntry(java.util.zip.ZipEntry("info.txt"))
@@ -1283,6 +1287,101 @@ class MainActivity : ComponentActivity() {
       .append(" (nomedia=").append(File(engineManager.dshDataDir, ".nomedia").exists())
       .append(", private-layout=").append(File(File(engineManager.homeDir, ".dsh"), ".private-layout").exists())
       .append(")\n")
+    sb.append(forensicsText())
+    return sb.toString()
+  }
+
+  /**
+   * 坑 80/78/79 的现场体检，随「导出调试日志」带回：**只报权限位、大小、存在性与关键字命中，
+   * 绝不写任何凭据/配置内容**。
+   *
+   * 为什么要这一段：用户报障的那台机器连不上调试台，而「没有临时工作区 + 发消息没回复」在
+   * 三处病灶上各有明确指纹——`.credentials.yaml` 带 group/other 位（坑 80，引擎直接不 spawn、
+   * 端口都不开）、`settings.yaml`/`settings.yaml.imported` 的组合（坑 80 二次导入重置供应商
+   * 路由）、`storages/` 被自愈改名（坑 78）、修复阶梯预算（坑 79）。以前这些只能靠 adb +
+   * run-as 现场取，用户侧无从自证；现在一次导出即可判型。
+   */
+  private fun forensicsText(): String {
+    val dsh = File(File(filesDir, "home"), ".dsh")
+    val sb = StringBuilder("forensics:\n")
+    fun rawMode(f: File): Int = try {
+      android.system.Os.stat(f.absolutePath).st_mode and 0x1FF
+    } catch (_: Throwable) {
+      -1
+    }
+    fun modeOf(f: File): String {
+      val m = rawMode(f)
+      return if (m < 0) "?" else java.lang.Integer.toOctalString(m)
+    }
+    val cred = File(dsh, ".credentials.yaml")
+    val credMode = if (cred.isFile) rawMode(cred) else -1
+    sb.append("  credentials: ").append(if (cred.isFile) "present" else "absent")
+      .append(" mode=").append(modeOf(cred))
+      .append(" size=").append(if (cred.isFile) cred.length() else -1)
+      // 引擎的闸只要求「无任何 group/other 读位」（600/400/700 都合法），不是硬等于 600。
+      .append(if (credMode >= 0 && (credMode and 0x3F) != 0) "  <= 坑 80：带 group/other 位会让 required 插件不激活（下次启动前壳侧会收敛为 600）\n" else "\n")
+    sb.append("  settings.yaml: present=").append(File(dsh, "settings.yaml").isFile)
+      .append(" imported=").append(File(dsh, "settings.yaml.imported").isFile)
+      .append("（imported 在场 = 出厂模板已被一次性导入消费过；此时归档模板不得重新落盘，坑 80）\n")
+    val heal = File(dsh, ".storage-heal.json")
+    val repair = File(filesDir, ".engine-repair.json")
+    sb.append("  storage-heal mirror: ").append(if (heal.isFile) heal.readText().take(200) else "absent").append('\n')
+    sb.append("  engine-repair budget: ").append(if (repair.isFile) repair.readText().take(200) else "absent").append('\n')
+    val storages = File(dsh, "storages")
+    val ws = File(storages, "workspace.json")
+    val quarantined = try {
+      storages.listFiles()?.count { it.name.contains(".corrupt-") || it.name.endsWith(".bak") } ?: -1
+    } catch (_: Throwable) {
+      -1
+    }
+    sb.append("  storages: workspace.json=").append(if (ws.isFile) ws.length().toString() + "B" else "absent")
+      .append(" healed/quarantined=").append(quarantined)
+      .append("（>0 即坑 78 存储自愈动过盘）\n")
+    val fp = File(filesDir, ".snapshot-fingerprint")
+    sb.append("  snapshot-fingerprint: ").append(if (fp.isFile) fp.readText().trim().take(12) else "absent (下次启动全量重抽)").append('\n')
+    try {
+      val logs = File(dsh, "logs")
+      val latest = (logs.listFiles()?.toList() ?: emptyList())
+        .filter { f -> f.name.startsWith("startup-") && f.name.endsWith(".log") }
+        .maxByOrNull { f -> f.lastModified() }
+      if (latest == null) {
+        sb.append("  startup log: absent\n")
+      } else {
+        val text = latest.readText()
+        val hits = listOf(
+          "did not activate", "readable beyond its owner", "StorageError", "plugin tree failed to load", "UncaughtException",
+        ).joinToString(", ") { sig -> sig + "=" + text.lineSequence().count { line -> line.contains(sig) } }
+        sb.append("  startup log（仅启动失败时写，看 mtime 判新旧）: ").append(latest.name)
+          .append(" mtime=").append(java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date(latest.lastModified())))
+          .append(" counts: ").append(hits).append('\n')
+        text.lineSequence().firstOrNull { it.contains("did not activate") || it.contains("readable beyond its owner") }
+          ?.let { sb.append("    first fatal line: ").append(it.take(240)).append('\n') }
+      }
+    } catch (t: Throwable) {
+      sb.append("  startup log: read failed ").append(t.javaClass.simpleName).append('\n')
+    }
+    // 在跑的那份日志才是当前状态：engine.log 的关键字命中数（与 zip 内的原文互为索引）。
+    try {
+      val live = File(filesDir, "engine.log")
+      if (live.isFile) {
+        val lt = live.readText()
+        val lc = listOf("did not activate", "readable beyond its owner", "StorageError", "UncaughtException")
+          .joinToString(", ") { sig -> sig + "=" + lt.lineSequence().count { line -> line.contains(sig) } }
+        sb.append("  engine.log (").append(live.length()).append("B, mtime ")
+          .append(java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date(live.lastModified()))).append(") counts: ").append(lc).append('\n')
+      } else {
+        sb.append("  engine.log: absent\n")
+      }
+    } catch (t: Throwable) {
+      sb.append("  engine.log: read failed ").append(t.javaClass.simpleName).append('\n')
+    }
+    val usb = try { org.json.JSONObject(UsbState.state(this)) } catch (_: Throwable) { null }
+    sb.append("  usb host=").append(UsbState.hasHostFeature(this))
+      .append(" devices=").append(usb?.optInt("count", -1) ?: -1)
+      .append(" mounts=").append(UsbState.env(this)["DSH_USB_MOUNTS"].orEmpty().ifEmpty { "-" })
+      .append("（坑 81：mounts 是插着的可移动卷里 app 域真能读的挂载点）\n")
     return sb.toString()
   }
 
