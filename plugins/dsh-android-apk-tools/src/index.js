@@ -228,9 +228,12 @@ async function javaFunctional() {
     const { stdout, stderr } = await execFileAsync(jb, ['-version'], {
       timeout: 30000, maxBuffer: 4 * 1024 * 1024, env: javaEnv(),
     });
-    const first = String(stderr || stdout || '').split('\n')[0].trim();
-    if (/version/i.test(first)) return { ok: true, state: 'ok', version: first };
-    return { ok: false, state: 'no-version', detail: first || '(空输出)' };
+    const out = String(stderr || stdout || '');
+    // JAVA_TOOL_OPTIONS 在场时 JVM 必先打 `Picked up JAVA_TOOL_OPTIONS: ...`，version 行不在第一行。
+    // 故逐行扫描，而不是只赌首行（坑 39 与本判定叠加会 100% 误判 no-version）。
+    const versionLine = out.split('\n').map(s => s.trim()).find(l => /version/i.test(l));
+    if (versionLine) return { ok: true, state: 'ok', version: versionLine };
+    return { ok: false, state: 'no-version', detail: out.split('\n')[0].trim() || '(空输出)' };
   } catch (err) {
     const detail = `${err.message || ''}${err.stderr ? ' ' + String(err.stderr).trim() : ''}`.trim();
     return { ok: false, state: /Permission denied|EACCES|CANNOT LINK|exec format/i.test(detail) ? 'exec-refused' : 'exec-failed', detail: detail.slice(0, 400) };
@@ -355,7 +358,13 @@ function tools() {
         : { ok: false, error: gate.error, guidance: gate.guidance };
       const unsigned = outApk + '.unsigned.apk';
       const aligned = outApk + '.aligned.apk';
-      const r1 = await runTool('apktool', 'apktool/apktool.jar', ['b', srcDir, '-o', unsigned]);
+      // apktool 内置的 aapt2 是 ET_EXEC 静态 ELF，部分设备内核（Android 16+ 类）拒绝 exec
+      //（报 has unexpected e_type: 2），构建死于 "Building resources" 阶段。
+      // Termux usr/bin/aapt2 是 PIE 版可跑（实测 2.20-android-16），在场时显式传 --aapt 覆盖。
+      const buildArgs = ['b', srcDir, '-o', unsigned];
+      const hostAapt2 = usrBin('aapt2');
+      if (existsSync(hostAapt2)) buildArgs.push('--aapt', hostAapt2);
+      const r1 = await runTool('apktool', 'apktool/apktool.jar', buildArgs);
       if (!r1.ok) return r1;
       let keystorePath = keystore;
       if (!keystorePath) {
