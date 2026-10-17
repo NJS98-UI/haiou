@@ -11,6 +11,11 @@
  * `true` 都是 proot error: execve("/usr/bin/bash"): Permission denied。现在把两个判据
  * 拆开，并做一次有界的真实冒烟；判定结果落进探针文件供壳侧复用（决定是否还要解压
  * 307MB rootfs）。
+ *
+ * 二次修复（坑 90）：冒烟只跑 `bash -lc true` 证的是「执行链」，旧文案却写「走通 proot-entry
+ * 全链」，把 apt 依赖的 DNS 解析关一并蒙混成「可用」——已 root 容器若踩 systemd-resolved 死桩
+ * （坑 89），执行成功但 apt 不能解析，这正是体检清单误报「rootfs 能跑通」而 gcc 失败的根因。
+ * 现把执行(usable)与解析(aptReady/dns)拆成两栏各说各的事实，dns 探测失败绝不回退 usable。
  */
 import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -70,6 +75,16 @@ function classifyFailure(text) {
   return 'unknown';
 }
 
+/**
+ * 提取 guest 里「command not found」的二进制名（minbase 未预装某工具时 bash 的固定话术）。
+ * 只在执行链本身没被判死（classifyFailure=unknown）时才有意义——那说明 bash 起来了、只是这个
+ * 命令不在 PATH 上。返回名字或 null。
+ */
+function commandNotFoundBin(stderr) {
+  const m = String(stderr || '').match(/([\w.+-]+):\s*(?:command not found|not found)/);
+  return m ? m[1] : null;
+}
+
 async function readProbe() {
   try { return JSON.parse(await fsp.readFile(probeFile(), 'utf8')); } catch { return null; }
 }
@@ -91,6 +106,25 @@ async function smokeContainer(timeoutMs) {
   if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, reason: 'smoke-timeout', tail: `容器冒烟超时（${timeoutMs}ms 内未返回）` };
   if (r.status === 0) return { ok: true, reason: '', tail: '' };
   return { ok: false, reason: classifyFailure(out), tail: tailOut(out).split('\n').slice(0, 3).join('\n') };
+}
+
+/**
+ * 执行链通了不等于 apt 通：apt 还依赖 DNS 解析。裸 chroot 的 /etc/resolv.conf 常见是
+ * systemd-resolved 的死桩（nameserver 127.0.0.53 无监听），getent 直接「Temporary failure
+ * in name resolution」——这正是坑 89 修的那道关。这里做一次有界解析探测，只作 aptReady 判据。
+ * 关键：探测失败绝不回退成 usable:false——纯离线 gcc 编译不需要网络，网络不通不代表容器不可用，
+ * 混成一个字段就会把健康的容器误判成坏（自造假阴性）。dns 与 usable 各说各的事实。
+ * getent 属 libc-bin（Ubuntu minbase 的 essential 包），恒在；解析失败与非零退出可分辨。
+ */
+async function dnsProbe(timeoutMs = 8000) {
+  const entry = ubuntuEntry();
+  const r = spawnSync('bash', [entry, '-lc', 'getent hosts ports.ubuntu.com >/dev/null'], {
+    timeout: timeoutMs, encoding: 'utf8',
+  });
+  if (r.error && r.error.code === 'ETIMEDOUT') return { dns: false, dnsReason: `dns-timeout(${timeoutMs}ms)` };
+  if (r.status === 0) return { dns: true, dnsReason: '' };
+  const first = tailOut(`${r.stdout || ''}${r.stderr || ''}`).split('\n')[0];
+  return { dns: false, dnsReason: first || `getent-exit-${r.status}` };
 }
 
 // su 落点候选，与壳侧 EngineManager.SU_CANDIDATES 对齐（坑 84 ⑤：改判据两侧同改）。Magisk/KernelSU
@@ -130,9 +164,13 @@ function tools() {
   const execTool = defineTool({
     name: 'ubuntu_exec',
     description:
-      'Execute a build or development command inside the Seagull Ubuntu container ' +
-      '(apt/dpkg/gcc/cmake/python3/java toolchain). Typically used for APK reverse/build, ' +
-      'C/C++ compilation, or Python tooling that needs a full distro.',
+      'Execute a build or development command inside the Seagull Ubuntu container via proot-entry. ' +
+      'HONEST SCOPE: the shipped rootfs is a slim Ubuntu minbase — it has NO gcc/cmake/clang/java ' +
+      'baked in (light-asset decision), so a first `gcc`/`java` call returns `command not found` ' +
+      '(exit 1). Run `ubuntu_toolchain_install` once (after ubuntu_status confirms the container is ' +
+      'usable) to apt-install build-essential/cmake/git/python3 before compiling here. NOTE: APK ' +
+      'build/sign/decompile (apktool·apksigner·jadx·java) run on the HOST Termux openjdk toolchain, ' +
+      'NOT in this container — use the apk_* tools for those; reserve this for distro-level Linux builds.',
     parameters: {
       command: { type: 'string', required: true, description: 'Shell command to run inside Ubuntu (bash -lc).' },
       timeoutMs: { type: 'number', description: 'Timeout in ms (default 120000).' },
@@ -168,18 +206,26 @@ function tools() {
         return { ok: true, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() };
       } catch (err) {
         const out = `${err.message || ''}\n${err.stderr || ''}`;
-        const reason = classifyFailure(out);
+        const cls = classifyFailure(out);
+        // 执行链本身没被判死（cls=unknown）却报 command not found → 极可能是 minbase 未预装该工具
+        // （轻资产化设计，非缺陷）。单列成 toolchain-not-installed，指回 ubuntu_toolchain_install，
+        // 别让模型在「exit=1 但看不出为什么」里反复试编译。注意这支不写探针：命令没找到≠内核拒执行。
+        const notFound = cls === 'unknown' ? commandNotFoundBin(err.stderr) : null;
+        const reason = notFound ? 'toolchain-not-installed' : cls;
         if (reason === 'kernel-refused-exec' || reason === 'linker-rejected-image') {
           await writeProbe({ blocked: true, reason, su: hasSu(), tail: tailOut(out).split('\n').slice(0, 3).join('\n'), runner: 'plugin-exec' });
         }
         return {
           ok: false, reason, error: err.message,
+          missingTool: notFound || undefined,
           stderr: err.stderr ? String(err.stderr).trim() : '',
           hint: reason === 'kernel-refused-exec'
             ? '内核/沙箱拒绝执行容器内的 ELF（非 bionic 链路镜像在 Android 16+ 与鸿蒙上直接 EACCES），不是命令写错，也不是 rootfs 缺失；重试无意义。'
             : reason === 'linker-rejected-image'
               ? '镜像被 linker 拒载（非 PIE / 与 /system/bin/linker64 不兼容）；proot 的 loader 属此类。'
-              : '容器执行链失败，见 stderr 原文。',
+              : notFound
+                ? `容器是 Ubuntu minbase，未预装 \`${notFound}\`（轻资产化设计，非缺陷）。若它是编译/开发工具，先跑 ubuntu_toolchain_install（默认装 build-essential/cmake/git/python3，也可传 packages="${notFound}" 指名）——前提是 ubuntu_status 显示容器 usable 且 apt 的 DNS 解析关已通（坑 89/90）。APK 的 java/apktool/apksigner 不在此列：它们走宿主 Termux（用 apk_* 工具）。`
+                : '容器执行链失败，见 stderr 原文。',
         };
       }
     },
@@ -192,7 +238,9 @@ function tools() {
       'Report the Ubuntu container honestly: whether the rootfs is present AND whether it can ' +
       'actually execute. Presence and usability are different facts — on Android 16+ and HarmonyOS ' +
       'the kernel refuses to exec non-bionic ELF, so a fully assembled 300MB rootfs can still be ' +
-      'a dead container. Set smoke=false to skip the bounded execution probe.',
+      'a dead container. Set smoke=false to skip the bounded execution probe. When exec passes, it ' +
+      'also runs a bounded DNS probe and reports apt-readiness separately (exec ≠ apt: a dead ' +
+      'resolv.conf stub or no network still executes bash fine but fails apt).',
     parameters: {
       smoke: { type: 'string', description: 'Set to "0" to skip the real exec probe (presence only, fast).' },
       timeoutMs: { type: 'number', description: 'Exec probe budget in ms (default 20000).' },
@@ -240,17 +288,35 @@ function tools() {
       }
       const s = await smokeContainer(timeoutMs);
       // 探针结论回写：壳侧下次启动据此决定是否还要解压 300MB rootfs；成功则清除 blocked 记录。
+      // 注意只回写「执行级」结论——dns 是运行期瞬时事实（有无网络/解析），不写进共用的
+      // ubuntu-container-probe.json（schema 1，壳侧 containerProbe 据此判解压），免得把
+      // 「此刻没网」当成永久 blocked 骗过壳侧、跳掉 300MB 解压。
       await writeProbe(s.ok
         ? { blocked: false, reason: '', su, execMode: base.execMode, runner: 'plugin' }
         : { blocked: s.reason === 'kernel-refused-exec' || s.reason === 'linker-rejected-image', reason: s.reason, su,
             execMode: base.execMode, loaderTypes: loaders.map((l) => l.eType), tail: s.tail, runner: 'plugin' });
-      return {
-        ...base, ok: s.ok, usable: s.ok, probed: true,
-        reason: s.ok ? '' : s.reason, smoke: s.ok ? { exit: 0 } : { exit: 1, tail: s.tail },
-        message: s.ok ? '容器可用：已用 bash -lc true 走通 proot-entry 全链。'
-          : `容器不可用（${s.reason}）。在场≠可用：rootfs 完整（usr/bin/bash ${st.size}B）但执行链被拒——` +
+      if (!s.ok) {
+        return {
+          ...base, ok: false, usable: false, probed: true,
+          reason: s.reason, smoke: { exit: 1, tail: s.tail },
+          message: `容器不可用（${s.reason}）。在场≠可用：rootfs 完整（usr/bin/bash ${st.size}B）但执行链被拒——` +
             'Android 16+ / 鸿蒙内核对 app 私有目录里的非 bionic ELF 直接 EACCES，' +
             'proot 的 loader 与 guest ld.so 全在这一条上；无 su（落点不限于 /system/bin/su）时没有 chroot 逃生通道。',
+        };
+      }
+      // 执行链已通，再单独验 apt 依赖的 DNS 解析关（有界，失败不翻 usable——离线 gcc 不需要网）。
+      const net = await dnsProbe();
+      const aptReady = net.dns;
+      return {
+        ...base, ok: true, usable: true, probed: true,
+        dns: net.dns, aptReady,
+        reason: '', smoke: { exit: 0 },
+        message: `容器可执行：bash -lc true 走通执行链（${base.execMode}）。` +
+          (net.dns
+            ? 'DNS 解析可用（ports.ubuntu.com 可解析），apt 装工具链的解析关已通' +
+              (su ? '。' : '；但纯 proot 无 root 时 dpkg 仍可能撞 SYSCONFDIR（坑 13），装工具链建议走 root chroot。')
+            : `⚠ 但 DNS 解析失败（${net.dnsReason || 'getent 不通'}）：执行链通 ≠ apt 通——` +
+              'apt-get update 会报「Temporary failure in name resolution」。查网络是否在，或 /etc/resolv.conf 是不是 systemd-resolved 死桩（坑 89）。'),
       };
     },
   });
