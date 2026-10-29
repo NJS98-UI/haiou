@@ -1382,6 +1382,15 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       File(dshPkgs, "dsh-spill-local/lib/index.js"))
     applyAssetPatch("patched/spill-local-index.js",
       File(home, "profiles/node_modules/@deepseek-ai/dsh-spill-local/lib/index.js"))
+    // 坑 93（2026-10-29）：长上下文会话把共享引擎进程拖死的预防面。上游 compaction-basic 的
+    // 压力压缩默认 thresholdRatio=0.8，而 llm-deepseek 的模型默认 contextWindow=1e6——即压力
+    // 压缩要到 ~80 万 token 才拦截，实践中永远轮不到：会话只在请求已被 API 拒收（
+    // CONTEXT_WINDOW_EXCEEDED）后才走溢出恢复，每次重试都是巨型请求 + 全量摘要回放，全部落在
+    // 单进程共享事件循环上，其他会话一起被拖慢。补丁把默认阈值降到 0.5（压缩在 50% 压力位
+    // 提前拦截；retainRatio 0.16 < 0.5 校验不变，modelPolicies 显式覆盖不受影响）。
+    // 与 spill-local 同一纪律：资产为 npm 0.1.7-rc.2 全文件单常量改写，快照构建与运行期双通道。
+    applyAssetPatch("patched/compaction-basic-index.js",
+      File(dshPkgs, "dsh-compaction-basic/lib/index.js"))
     // @dsh-android/dsh-client-ui-responsive 是本仓库自持的浏览器插件：official 构建链由
     // scripts/inject-snapshot.py 把 repo 的 lib/client.js 打进 snapshot.tar.xz，但已发布的
     // 快照归档里仍是 0.1.1 slot 契约的旧 bundle（conversation/details 槽位在 0.1.7 已删除，
@@ -1751,8 +1760,12 @@ exec "${'$'}PROOT_BIN" --link2symlink --kill-on-exit -0 -r "${'$'}ROOTFS_DIR" -b
       // (the WebView IS the UI). Without it, rc.2's spawn xdg-open on a missing
       // binary stalls engine serve on some emulators (MuMu root observed);
       // the flag is the official engine CLI switch (see bin.js docs).
+      // --max-old-space-size（坑 93）：所有会话共享这一个 node 进程，无界堆会让单个
+      // 长上下文会话把 RSS 一路推到 Android LMK 区间——整机（前台服务 + WebView + 看门狗）
+      // 一起被杀，所有会话陪葬。有界堆把「撑死」变成确定性 node OOM → 看门狗按既有
+      // 失败路径干净重启（会话本体有 JSONL 持久化，重启即恢复），爆炸半径从整机收敛到单进程。
       val args = arrayOf(
-        nodeBin.absolutePath, "--expose-internals", dshBin.absolutePath, "web", "--port", port.toString(), "--no-open",
+        nodeBin.absolutePath, "--expose-internals", "--max-old-space-size=768", dshBin.absolutePath, "web", "--port", port.toString(), "--no-open",
       )
       EngineManager.engineProcess = startWithArgs(args, shellEnv())
       // The cooldown is written only after a real start: failure paths don't consume the window (retry is immediate).

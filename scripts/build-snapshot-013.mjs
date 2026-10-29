@@ -208,6 +208,17 @@ const U = join(STAGE, 'root', 'usr')
       wsl(`cp "${wslPath(SPILL_ASSET)}" "${wslPath(SPILL_DEST)}"`)
       log('  spill-local Android 祖先判据: @deepseek-ai/dsh-spill-local/lib/index.js（坑 76）')
     }
+    // 坑 93（2026-10-29）：compaction-basic 默认 thresholdRatio 0.8 → 0.5（移动端长上下文
+    // 预防面——0.8×1M 默认窗口 ≈ 80 万 token 才压缩，实践中永远轮到溢出恢复救场）。资产是
+    // npm 0.1.7-rc.2 全文件单常量改写，与壳侧 applyRuntimePatches 用同一真源；缺失该包说明
+    // 依赖树变了，硬失败。
+    {
+      const COMPACT_ASSET = join(ROOT, 'app', 'src', 'main', 'assets', 'patched', 'compaction-basic-index.js')
+      const COMPACT_DEST = join(ENGINE_NM_STAGE, '@deepseek-ai', 'dsh-compaction-basic', 'lib', 'index.js')
+      if (!existsSync(COMPACT_DEST)) throw new Error(`快照缺 dsh-compaction-basic（依赖树变了？）: ${COMPACT_DEST}`)
+      wsl(`cp "${wslPath(COMPACT_ASSET)}" "${wslPath(COMPACT_DEST)}"`)
+      log('  compaction-basic 移动端压缩阈值: @deepseek-ai/dsh-compaction-basic/lib/index.js（坑 93）')
+    }
     // 根包本体：只换 lib/ 与 package.json（node_modules 子树 = 全引擎依赖，绝不可动）
     const root = OVERLAY.rootPackage
     const tgz = await overlayTgz(root.name, root.version)
